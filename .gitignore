@@ -1,3 +1,10 @@
+# Override the user's global `*.mod*` exclude — Go module files
+# are not optional, they ARE the project. Without this negation,
+# go.mod / build/go.mod / build/render-docs/go.mod all get dropped
+# silently and CI's setup-go step fails with "go.mod does not exist".
+!go.mod
+!**/go.mod
+
 # Build artifacts — produced by `make bundle`. Always regenerated
 # from sources, never edited by hand.
 /dist/
