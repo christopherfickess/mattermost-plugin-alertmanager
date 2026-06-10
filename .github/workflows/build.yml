@@ -28,8 +28,11 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # `make dist` is the full chain: server (cross-compile binaries) +
+      # webapp (no-op here, no webapp) + bundle (tarball assembly). `make
+      # bundle` alone skips the server build and fails on `cp server/dist`.
       - name: Build bundle
-        run: make bundle
+        run: make dist
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
