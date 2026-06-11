@@ -18,17 +18,17 @@ import (
 // a secret — keeping the surface explicit prevents the "let's just
 // allow .Labels.* and trust the rule author" mistake.
 var labelPlaceholderAllowlist = map[string]bool{
-	"alertname": true,
-	"app":       true,
-	"cluster":   true,
-	"container": true,
+	"alertname":  true,
+	"app":        true,
+	"cluster":    true,
+	"container":  true,
 	"deployment": true,
-	"instance":  true,
-	"job":       true,
-	"namespace": true,
-	"node":      true,
-	"pod":       true,
-	"service":   true,
+	"instance":   true,
+	"job":        true,
+	"namespace":  true,
+	"node":       true,
+	"pod":        true,
+	"service":    true,
 }
 
 // labelPlaceholderRegex matches `<name>` where name is a lowercase
