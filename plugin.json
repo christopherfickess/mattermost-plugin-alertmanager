@@ -1,7 +1,7 @@
 {
     "id": "com.mattermost.alertmanager",
     "name": "Alertmanager",
-    "description": "Brings Prometheus Alertmanager alerts into Mattermost via native incoming webhooks. Run `/alertmanager help` in any channel for the command list.",
+    "description": "Bring Prometheus Alertmanager alerts into Mattermost with the runbook attached. Each alert post includes the runbook's first three diagnostic commands inline, pre-filled with the failing host and pod from the alert's labels — copy-paste ready at 3am. Run `/alertmanager help` for the full command list.",
     "homepage_url": "https://github.com/MattermostFederal/mattermost-plugin-alertmanager",
     "support_url": "https://github.com/MattermostFederal/mattermost-plugin-alertmanager/issues",
     "icon_path": "assets/alertmanager-logo.svg",

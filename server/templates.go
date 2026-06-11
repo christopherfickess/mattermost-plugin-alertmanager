@@ -51,7 +51,14 @@ const canonicalTemplate = `- name: {{NAME}}
       # if either drifts, the other still carries the right values.
       username: 'alertmanagerbot'
       icon_url: '{{ICON_URL}}'
-      color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+      # Sidebar color. Mattermost honors Slack-named colors
+      # (good/warning/danger) plus arbitrary hex codes. Mapping:
+      #   firing + warning  -> yellow
+      #   firing + critical -> red
+      #   firing + info     -> blue hex
+      #   firing + (else)   -> red (safer default for unlabeled)
+      #   resolved          -> green
+      color: '{{ if eq .Status "firing" }}{{ if eq .CommonLabels.severity "warning" }}warning{{ else if eq .CommonLabels.severity "critical" }}danger{{ else if eq .CommonLabels.severity "info" }}#3b82f6{{ else }}danger{{ end }}{{ else }}good{{ end }}'
       title: |-
         [{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }}
         {{- if gt (len .CommonLabels) (len .GroupLabels) -}}

@@ -2,13 +2,18 @@ package main
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/mattermost/mattermost/server/public/model"
+
+	amconfig "github.com/prometheus/alertmanager/config"
+	"github.com/prometheus/alertmanager/dispatch"
 )
 
 // admin_inventory.go owns the /admin/inventory endpoint: a sysadmin-gated
@@ -255,6 +260,98 @@ func (p *Plugin) renderInventoryHTML(w http.ResponseWriter, r *http.Request, con
 	}
 	sort.Slice(amDrift, func(i, j int) bool { return amDrift[i].AMURL < amDrift[j].AMURL })
 
+	// Route tester inputs. Three modes:
+	//   simulate     → read-only, walk AM route tree against labels
+	//   webhook-test → POST a hardcoded test payload to each target's
+	//                  webhook URL (tests MM side only, bypasses AM)
+	//   end-to-end   → POST a synthetic alert to AM, AM templates +
+	//                  delivers (tests the full chain)
+	//
+	// Target uses a single dropdown with optgroups separating
+	// "Groups" from "Individual runbooks." The encoded value is
+	// `all`, `group:<name>`, or `individual:<slug>` — the prefix
+	// disambiguates without needing a separate type field.
+	//
+	// channel filters the target receiver list to those in a specific
+	// channel (only relevant for webhook-test + end-to-end; simulate
+	// walks the route tree at the AM level).
+	simMode := strings.TrimSpace(r.URL.Query().Get("simulate_mode"))
+	simType := strings.TrimSpace(r.URL.Query().Get("simulate_type"))
+	simValue := strings.TrimSpace(r.URL.Query().Get("simulate_value"))
+	simChannel := strings.TrimSpace(r.URL.Query().Get("simulate_channel"))
+	simSeverity := strings.TrimSpace(r.URL.Query().Get("simulate_severity"))
+	simExtra := strings.TrimSpace(r.URL.Query().Get("simulate_extra"))
+
+	formSubmitted := simMode != "" || simType != "" || simValue != "" || simChannel != "" || simSeverity != "" || simExtra != ""
+
+	var simResult inventorySimResult
+	var simMatrix []inventorySimResult
+	var simActionResult inventoryActionResult
+
+	if formSubmitted {
+		// Decode (type, value) into a list of slugs.
+		targetSlugs := decodeTargetSelection(simType, simValue)
+		filteredConfigs := filterConfigsByChannel(configs, simChannel)
+
+		switch simMode {
+		case "webhook-test":
+			simActionResult = p.runInventoryWebhookTest(targetSlugs, filteredConfigs)
+		case "end-to-end":
+			simActionResult = p.runInventoryEndToEnd(targetSlugs, simSeverity, simExtra, filteredConfigs, amStatus)
+		default:
+			// simulate (default)
+			if len(targetSlugs) > 1 {
+				simMatrix = p.runInventorySimulationMatrixForSlugs(targetSlugs, simSeverity, simExtra, configs, amStatus)
+			} else if len(targetSlugs) == 1 {
+				simResult = p.runInventorySimulation(buildSimulateLabelsInput(targetSlugs[0], simSeverity, simExtra), configs, amStatus)
+			} else {
+				// No slugs selected — just sim with severity/extra alone
+				if simSeverity != "" || simExtra != "" {
+					simResult = p.runInventorySimulation(buildSimulateLabelsInput("", simSeverity, simExtra), configs, amStatus)
+				} else {
+					simResult = inventorySimResult{Mode: "error", Message: "Pick a target type + group/runbook OR supply labels via the extras field."}
+				}
+			}
+		}
+	}
+
+	// Enumerate distinct channel names for the Channel dropdown.
+	channelSet := make(map[string]bool)
+	for _, c := range configs {
+		channelSet[c.Channel] = true
+	}
+	channelOptions := make([]string, 0, len(channelSet))
+	for c := range channelSet {
+		channelOptions = append(channelOptions, c)
+	}
+	sort.Strings(channelOptions)
+
+	// Enumerate group names from scaffoldSets (excluding the "all"
+	// alias so we don't confuse it with the matrix-mode target type).
+	groupOptions := make([]string, 0, len(scaffoldSets))
+	for g := range scaffoldSets {
+		if g == "all" {
+			continue
+		}
+		groupOptions = append(groupOptions, g)
+	}
+	sort.Strings(groupOptions)
+
+	// Build the target → channels map for the JS-driven channel
+	// dropdown. For each target value the dropdown can take, list
+	// channels that actually have at least one matching receiver
+	// so the channel options don't include channels where the
+	// chosen target has no presence. Computed server-side, embedded
+	// as JSON, applied by a small JS handler at page load + on
+	// target dropdown change.
+	targetChannels := buildTargetChannelMap(configs, groupOptions, runbookSlugs())
+	targetChannelsJSON, _ := json.Marshal(targetChannels)
+	// Also serialize the bare list of groups + slugs for the JS
+	// type-cascading: when the admin picks Type=group, the secondary
+	// dropdown swaps to show this list; same for Type=individual.
+	groupsJSON, _ := json.Marshal(groupOptions)
+	slugsJSON, _ := json.Marshal(runbookSlugs())
+
 	data := struct {
 		Total             int
 		Channels          int
@@ -266,6 +363,21 @@ func (p *Plugin) renderInventoryHTML(w http.ResponseWriter, r *http.Request, con
 		GroupMode         string
 		Version           string
 		CSVHref           string
+		SimulateMode       string
+		SimulateType       string
+		SimulateValue      string
+		SimulateChannel    string
+		SimulateSeverity   string
+		SimulateExtra      string
+		SimulateResult     inventorySimResult
+		SimulateMatrix     []inventorySimResult
+		SimulateAction     inventoryActionResult
+		RunbookSlugs       []string
+		ChannelOptions     []string
+		GroupOptions       []string
+		TargetChannelsJSON template.JS
+		GroupOptionsJSON   template.JS
+		RunbookSlugsJSON   template.JS
 	}{
 		Total:             len(configs),
 		Channels:          countDistinctChannels(configs),
@@ -276,6 +388,21 @@ func (p *Plugin) renderInventoryHTML(w http.ResponseWriter, r *http.Request, con
 		ReconcilerHealthy: reconcilerHealthy,
 		GroupMode:         groupMode,
 		Version:           Manifest.Version,
+		SimulateMode:       simMode,
+		SimulateType:       simType,
+		SimulateValue:      simValue,
+		SimulateChannel:    simChannel,
+		SimulateSeverity:   simSeverity,
+		SimulateExtra:      simExtra,
+		SimulateResult:     simResult,
+		SimulateMatrix:     simMatrix,
+		SimulateAction:     simActionResult,
+		RunbookSlugs:       runbookSlugs(),
+		ChannelOptions:     channelOptions,
+		GroupOptions:       groupOptions,
+		TargetChannelsJSON: template.JS(targetChannelsJSON),
+		GroupOptionsJSON:   template.JS(groupsJSON),
+		RunbookSlugsJSON:   template.JS(slugsJSON),
 		// Relative URL: browser resolves against the current URL,
 		// which is /plugins/<id>/admin/inventory. Using `?format=csv`
 		// gives the right target. Earlier bug: using r.URL.Path
@@ -287,6 +414,458 @@ func (p *Plugin) renderInventoryHTML(w http.ResponseWriter, r *http.Request, con
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := inventoryTemplate.Execute(w, data); err != nil {
 		p.API.LogWarn("admin-inventory: template render failed", "err", err.Error())
+	}
+}
+
+// inventorySimResult is what the inventory page's route-simulator
+// section shows. Empty Mode = no simulation was requested; the form
+// renders without a result block.
+type inventorySimResult struct {
+	Mode      string // "", "ok", "fell-through", "error"
+	Message   string
+	AMURL     string
+	Labels    map[string]string // sorted for stable rendering
+	Receivers []string          // for Mode == "ok", the matched receivers
+	DefaultRx string            // for Mode == "fell-through"
+
+	// MatrixRow is set when this result is one row of a matrix
+	// (simulate-all-runbooks mode). Holds the runbook slug this
+	// row represents — used by the template to render a table.
+	MatrixRow string
+}
+
+// parseEndToEndExtraLabels splits the admin page form's free-text
+// extra-labels field into a label map for the synthetic alert. Input
+// is space-separated `key=value` pairs (same shape the simulate path
+// accepts). Lenient parser — silently skips malformed pairs since the
+// form input is operator-supplied and a strict reject would block the
+// fire on a typo. Strict validation happens at the simulate path
+// (which uses parseSimulateLabels). For end-to-end, AM will reject
+// invalid labels at the API boundary anyway.
+func parseEndToEndExtraLabels(extra string) map[string]string {
+	if extra == "" {
+		return nil
+	}
+	labels := map[string]string{}
+	for _, pair := range strings.Fields(extra) {
+		eq := strings.IndexByte(pair, '=')
+		if eq < 1 || eq == len(pair)-1 {
+			continue
+		}
+		labels[pair[:eq]] = pair[eq+1:]
+	}
+	if len(labels) == 0 {
+		return nil
+	}
+	return labels
+}
+
+// buildSimulateLabelsInput composes the dropdown + free-text values
+// into the space-separated `key=value` shape that
+// parseSimulateLabels accepts. Empty dropdown values are skipped;
+// the free-text extra is appended as-is so power users can pass
+// any labels they want (namespace, pod, app, etc.).
+func buildSimulateLabelsInput(runbook, severity, extra string) string {
+	var parts []string
+	if runbook != "" {
+		parts = append(parts, "runbook="+runbook)
+	}
+	if severity != "" {
+		parts = append(parts, "severity="+severity)
+	}
+	if extra != "" {
+		parts = append(parts, extra)
+	}
+	return strings.Join(parts, " ")
+}
+
+// inventoryActionResult captures the outcome of a side-effect
+// action from the admin page form (webhook-test or end-to-end fire).
+// Different shape than inventorySimResult because the per-target
+// summary needs to include success/fail status, not route matches.
+type inventoryActionResult struct {
+	Mode    string         // "" / "webhook-test" / "end-to-end" / "error"
+	Channel string         // channel scope if filtered
+	Items   []actionResult // per-receiver / per-runbook outcome
+	Summary string         // overall summary (e.g., "fired 6 of 6")
+	Error   string         // if Mode == "error"
+}
+
+type actionResult struct {
+	Name    string // receiver name OR runbook slug, depending on mode
+	OK      bool
+	Detail  string // success-detail or error message
+}
+
+// buildTargetChannelMap returns a map from each possible target
+// dropdown value to the list of channels that actually host at
+// least one matching receiver. Used by the admin page's JS to
+// filter the Channel dropdown so it only offers channels where the
+// chosen target has presence. Empty list = no channel has any
+// matching receiver (dropdown collapses to just "(any channel)").
+//
+// Keys:
+//   ""             — any target (= all channels with plugin receivers)
+//   "all"          — same as ""
+//   "group:<name>" — channels with at least one receiver in that group
+//   "individual:<slug>" — channels with that specific receiver
+func buildTargetChannelMap(configs []alertConfig, groups, slugs []string) map[string][]string {
+	out := make(map[string][]string)
+
+	// Per-slug → set of channels
+	slugChannels := make(map[string]map[string]bool, len(slugs))
+	for _, c := range configs {
+		base := receiverBaseSlug(c.Name)
+		if slugChannels[base] == nil {
+			slugChannels[base] = make(map[string]bool)
+		}
+		slugChannels[base][c.Channel] = true
+	}
+
+	// All channels with any receiver — used for the "all" + empty
+	// keys + as the union basis for groups.
+	allChannelsSet := make(map[string]bool)
+	for _, ch := range slugChannels {
+		for c := range ch {
+			allChannelsSet[c] = true
+		}
+	}
+	allChannels := sortedKeys(allChannelsSet)
+	out[""] = allChannels
+	out["all"] = allChannels
+
+	// Per-individual entries.
+	for _, slug := range slugs {
+		out["individual:"+slug] = sortedKeys(slugChannels[slug])
+	}
+
+	// Per-group entries — union of channels across the group's slugs.
+	for _, group := range groups {
+		setSlugs, ok := scaffoldSets[group]
+		if !ok {
+			continue
+		}
+		union := make(map[string]bool)
+		for _, slug := range setSlugs {
+			for c := range slugChannels[slug] {
+				union[c] = true
+			}
+		}
+		out["group:"+group] = sortedKeys(union)
+	}
+
+	return out
+}
+
+// sortedKeys returns the keys of a string-bool map in sorted order.
+// Handles nil maps — returns nil rather than empty slice — so the
+// JSON output is `null` for empty entries (JS treats `null` and
+// missing key the same).
+func sortedKeys(m map[string]bool) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// decodeTargetSelection turns the (Type, Value) dropdown pair into
+// a flat list of runbook slugs:
+//   type=all                → all 20 slugs (value ignored)
+//   type=group, value=X     → scaffoldSets[X]
+//   type=individual, value=X → [X]
+//   anything else           → nil (caller falls back to label-only sim)
+//
+// Two-dropdown cascade lets the secondary dropdown's contents
+// reflect what was picked in the primary — JS swaps it client-side,
+// the backend just trusts the (type, value) pair it receives.
+func decodeTargetSelection(typ, value string) []string {
+	switch typ {
+	case "all":
+		return runbookSlugs()
+	case "group":
+		if value == "" {
+			return nil
+		}
+		if slugs, ok := scaffoldSets[value]; ok && len(slugs) > 0 {
+			out := make([]string, len(slugs))
+			copy(out, slugs)
+			sort.Strings(out)
+			return out
+		}
+	case "individual":
+		if value != "" {
+			return []string{value}
+		}
+	}
+	return nil
+}
+
+// filterConfigsByChannel scopes the receiver list to those bound to
+// a specific channel. Empty channel = no filtering.
+func filterConfigsByChannel(configs []alertConfig, channel string) []alertConfig {
+	if channel == "" {
+		return configs
+	}
+	out := make([]alertConfig, 0, len(configs))
+	for _, c := range configs {
+		if c.Channel == channel {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// runInventorySimulationMatrixForSlugs runs a simulation per slug
+// from the supplied list (instead of all 20). Used when the admin
+// picks a Group target — we get a coverage table scoped to just
+// that group.
+func (p *Plugin) runInventorySimulationMatrixForSlugs(slugs []string, severity, extra string, configs []alertConfig, amStatus map[string]amReachabilityEntry) []inventorySimResult {
+	out := make([]inventorySimResult, 0, len(slugs))
+	for _, slug := range slugs {
+		input := buildSimulateLabelsInput(slug, severity, extra)
+		row := p.runInventorySimulation(input, configs, amStatus)
+		row.MatrixRow = slug
+		out = append(out, row)
+	}
+	return out
+}
+
+// runInventoryWebhookTest POSTs a hardcoded test payload directly
+// to each target receiver's Mattermost webhook URL. Tests the
+// MM-side of the pipeline (webhook auth + channel binding + post
+// creation) without going through Alertmanager at all.
+//
+// Limited to receivers in the filtered configs (channel-scoped if
+// the admin picked a channel; otherwise all). Matches a target
+// slug if any receiver's name has that slug as its prefix (via
+// receiverBaseSlug — handles the channel-suffix pattern).
+func (p *Plugin) runInventoryWebhookTest(targetSlugs []string, configs []alertConfig) inventoryActionResult {
+	res := inventoryActionResult{Mode: "webhook-test"}
+	if len(targetSlugs) == 0 {
+		res.Mode = "error"
+		res.Error = "No target receivers selected. Pick a group/individual target first."
+		return res
+	}
+
+	slugSet := make(map[string]bool, len(targetSlugs))
+	for _, s := range targetSlugs {
+		slugSet[s] = true
+	}
+
+	for _, ac := range configs {
+		if !slugSet[receiverBaseSlug(ac.Name)] {
+			continue
+		}
+		webhookURL := p.webhookURLForReceiver(ac)
+		err := postValidateTestMessage(webhookURL, ac.Name)
+		item := actionResult{Name: ac.Name, OK: err == nil}
+		if err == nil {
+			item.Detail = "Posted test payload — check the channel for the message."
+		} else {
+			item.Detail = err.Error()
+		}
+		res.Items = append(res.Items, item)
+	}
+
+	if len(res.Items) == 0 {
+		res.Mode = "error"
+		res.Error = "No receivers matched the target selection + channel filter."
+		return res
+	}
+
+	ok := 0
+	for _, i := range res.Items {
+		if i.OK {
+			ok++
+		}
+	}
+	res.Summary = fmt.Sprintf("Posted %d of %d webhook test payloads.", ok, len(res.Items))
+	return res
+}
+
+// runInventoryEndToEnd POSTs synthetic alerts to AM for each target
+// slug. AM then templates + delivers them via its loaded
+// slack_configs. Tests the full Prometheus → AM → MM chain (minus
+// Prometheus, since the plugin is the alert source here).
+//
+// One alert per slug; severity from form (default warning); extra
+// labels from free text. All alerts include `source=admin-page-test`
+// so they can be silenced later if the admin needs to suppress
+// repeat tests.
+func (p *Plugin) runInventoryEndToEnd(targetSlugs []string, severity, extra string, configs []alertConfig, amStatus map[string]amReachabilityEntry) inventoryActionResult {
+	res := inventoryActionResult{Mode: "end-to-end"}
+	if len(targetSlugs) == 0 {
+		res.Mode = "error"
+		res.Error = "No target runbooks selected. Pick a group/individual target first."
+		return res
+	}
+
+	// Find an AM URL to fire against. Prefer one that's bound to a
+	// receiver matching one of our target slugs (so AM actually has
+	// a route for the alert we're firing).
+	slugSet := make(map[string]bool, len(targetSlugs))
+	for _, s := range targetSlugs {
+		slugSet[s] = true
+	}
+	var amURL string
+	for _, ac := range configs {
+		if slugSet[receiverBaseSlug(ac.Name)] {
+			if entry, ok := amStatus[ac.AlertManagerURL]; ok && entry.Reachable {
+				amURL = ac.AlertManagerURL
+				break
+			}
+		}
+	}
+	if amURL == "" {
+		res.Mode = "error"
+		res.Error = "No reachable Alertmanager backing the selected target receivers."
+		return res
+	}
+
+	// Parse the free-text extra labels field into a map. Form input
+	// is lenient — silently skip malformed pairs (no `=`, empty key,
+	// empty value). The synthetic-alert markers in
+	// postValidateSyntheticAlert override anything the operator types
+	// for `test` / `source` / `alertname` / `runbook` / `severity`,
+	// which is intentional: those identify the alert as synthetic.
+	extraLabels := parseEndToEndExtraLabels(extra)
+
+	for _, slug := range targetSlugs {
+		alertID, err := postValidateSyntheticAlert(amURL, slug, severity, extraLabels)
+		item := actionResult{Name: slug, OK: err == nil}
+		if err == nil {
+			item.Detail = "Fired synthetic alert id " + alertID + " — watch the bound channels for delivery."
+		} else {
+			item.Detail = err.Error()
+		}
+		res.Items = append(res.Items, item)
+	}
+
+	ok := 0
+	for _, i := range res.Items {
+		if i.OK {
+			ok++
+		}
+	}
+	res.Summary = fmt.Sprintf("Fired %d of %d synthetic alerts to %s.", ok, len(res.Items), amURL)
+	return res
+}
+
+// runInventorySimulationMatrix walks every shipped runbook slug,
+// builds a label set per slug, and simulates the route resolution.
+// Output is a slice of inventorySimResult, one per runbook, that
+// the template renders as a coverage table. Useful for answering
+// "do all 20 of my runbooks actually have working routes wired up?"
+// at a glance.
+//
+// The same `severity` + `extra` inputs from the form are applied
+// to every row — letting the admin ask "what would each runbook
+// fire to AT CRITICAL severity in the billing namespace?" by
+// filling those slots while leaving runbook on __all__.
+func (p *Plugin) runInventorySimulationMatrix(severity, extra string, configs []alertConfig, amStatus map[string]amReachabilityEntry) []inventorySimResult {
+	slugs := runbookSlugs()
+	out := make([]inventorySimResult, 0, len(slugs))
+	for _, slug := range slugs {
+		input := buildSimulateLabelsInput(slug, severity, extra)
+		row := p.runInventorySimulation(input, configs, amStatus)
+		row.MatrixRow = slug
+		out = append(out, row)
+	}
+	return out
+}
+
+// runInventorySimulation parses the form's label input, picks the
+// first reachable AM, walks its loaded route tree against the
+// labels, and returns a result struct the template can render.
+// Same engine as the /alertmanager validate --simulate command — just
+// a different entry point. Empty input is not an error: returns
+// zero-value result so the page renders just the form.
+func (p *Plugin) runInventorySimulation(input string, configs []alertConfig, amStatus map[string]amReachabilityEntry) inventorySimResult {
+	if input == "" {
+		return inventorySimResult{}
+	}
+
+	// Parse `key=value key=value ...` (space-separated, same shape
+	// as the slash command).
+	parts := strings.Fields(input)
+	labels, err := parseSimulateLabels(parts)
+	if err != nil {
+		return inventorySimResult{
+			Mode:    "error",
+			Message: fmt.Sprintf("Bad label input: %v", err),
+		}
+	}
+
+	// Pick a backend. The inventory page can have multiple AMs across
+	// channels; for v1 we run the sim against the first reachable
+	// one. If multiple AMs are in play and they have divergent route
+	// trees, an admin can use the slash command from the channel
+	// bound to the specific AM they care about.
+	var amURL string
+	var entry amReachabilityEntry
+	for _, c := range configs {
+		if e, ok := amStatus[c.AlertManagerURL]; ok && e.Reachable && e.ConfigBody != "" {
+			amURL = c.AlertManagerURL
+			entry = e
+			break
+		}
+	}
+	if amURL == "" {
+		return inventorySimResult{
+			Mode:    "error",
+			Message: "No reachable Alertmanager found in the current inventory. Need at least one AM URL the plugin can fetch /api/v2/status from.",
+		}
+	}
+
+	cfg, err := amconfig.Load(entry.ConfigBody)
+	if err != nil {
+		return inventorySimResult{
+			Mode:    "error",
+			Message: fmt.Sprintf("AM at %s loaded a config that doesn't parse: %v", amURL, err),
+			AMURL:   amURL,
+		}
+	}
+	if cfg.Route == nil {
+		return inventorySimResult{
+			Mode:    "error",
+			Message: fmt.Sprintf("AM at %s has no route: block to walk.", amURL),
+			AMURL:   amURL,
+		}
+	}
+
+	mainRoute := dispatch.NewRoute(cfg.Route, nil)
+	matches := mainRoute.Match(labels)
+
+	// Convert labels to sorted display form for the template.
+	labelDisplay := make(map[string]string, len(labels))
+	for k, v := range labels {
+		labelDisplay[string(k)] = string(v)
+	}
+
+	if len(matches) == 0 || (len(matches) == 1 && string(matches[0].RouteOpts.Receiver) == cfg.Route.Receiver) {
+		return inventorySimResult{
+			Mode:      "fell-through",
+			Message:   "No sub-route matched. Alert would fall through to the default receiver.",
+			AMURL:     amURL,
+			Labels:    labelDisplay,
+			DefaultRx: cfg.Route.Receiver,
+		}
+	}
+
+	receivers := make([]string, 0, len(matches))
+	for _, m := range matches {
+		receivers = append(receivers, string(m.RouteOpts.Receiver))
+	}
+	return inventorySimResult{
+		Mode:      "ok",
+		AMURL:     amURL,
+		Labels:    labelDisplay,
+		Receivers: receivers,
 	}
 }
 
@@ -452,6 +1031,152 @@ var inventoryTemplate = template.Must(template.New("inventory").Parse(`<!DOCTYPE
     </div>
     {{end}}
 
+    <div class="summary" style="background: #f8fafc; border-left: 4px solid #1d3a8c;">
+        <h3>:mag: Route tester</h3>
+        <div style="font-size: 13px; color: #555; margin-bottom: 12px;">Three modes for verifying your alerting pipeline:
+            <ul style="margin: 4px 0 8px 20px; padding: 0;">
+                <li><strong>Simulate</strong> — walks Alertmanager's loaded route tree, reports matched receivers. Read-only.</li>
+                <li><strong>Webhook test</strong> — POSTs a hardcoded test payload to each receiver's Mattermost webhook. Bypasses Alertmanager. Tests the MM side only.</li>
+                <li><strong>End-to-end</strong> — fires a synthetic alert through Alertmanager. Tests the full chain. Real chat posts result.</li>
+            </ul>
+        </div>
+        <form method="get" action="" style="display: flex; flex-direction: column; gap: 10px;">
+            <input type="hidden" name="group" value="{{.GroupMode}}">
+            <div style="display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap;">
+                <div style="display: flex; flex-direction: column; gap: 4px;">
+                    <span style="font-size: 11px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.04em;">Mode</span>
+                    <select name="simulate_mode" style="padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px;">
+                        <option value="simulate" {{if or (eq "simulate" .SimulateMode) (eq "" .SimulateMode)}}selected{{end}}>Simulate (read-only)</option>
+                        <option value="webhook-test" {{if eq "webhook-test" .SimulateMode}}selected{{end}}>Webhook test</option>
+                        <option value="end-to-end" {{if eq "end-to-end" .SimulateMode}}selected{{end}}>End-to-end</option>
+                    </select>
+                </div>
+                <div style="display: flex; flex-direction: column; gap: 4px;">
+                    <span style="font-size: 11px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.04em;">Type</span>
+                    <select name="simulate_type" style="padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; min-width: 140px;">
+                        <option value="">(pick type)</option>
+                        <option value="all" {{if eq "all" .SimulateType}}selected{{end}}>All runbooks</option>
+                        <option value="group" {{if eq "group" .SimulateType}}selected{{end}}>Group</option>
+                        <option value="individual" {{if eq "individual" .SimulateType}}selected{{end}}>Individual</option>
+                    </select>
+                </div>
+                <div style="display: flex; flex-direction: column; gap: 4px;">
+                    <span style="font-size: 11px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.04em;">Target</span>
+                    <select name="simulate_value" style="padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; min-width: 200px;">
+                        <option value="">(pick type first)</option>
+                    </select>
+                </div>
+                <div style="display: flex; flex-direction: column; gap: 4px;">
+                    <span style="font-size: 11px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.04em;">Channel</span>
+                    <select name="simulate_channel" style="padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; min-width: 200px;">
+                        <option value="">(any channel)</option>
+                        {{range .ChannelOptions}}<option value="{{.}}" {{if eq . $.SimulateChannel}}selected{{end}}>{{.}}</option>{{end}}
+                    </select>
+                </div>
+                <div style="display: flex; flex-direction: column; gap: 4px;">
+                    <span style="font-size: 11px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.04em;">Severity</span>
+                    <select name="simulate_severity" style="padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px;">
+                        <option value="">(none)</option>
+                        <option value="warning" {{if eq "warning" .SimulateSeverity}}selected{{end}}>warning</option>
+                        <option value="critical" {{if eq "critical" .SimulateSeverity}}selected{{end}}>critical</option>
+                        <option value="info" {{if eq "info" .SimulateSeverity}}selected{{end}}>info</option>
+                    </select>
+                </div>
+            </div>
+            <input type="text" name="simulate_extra" value="{{.SimulateExtra}}" placeholder="Additional labels (optional): namespace=billing pod=api-7d9 service=checkout" style="padding: 8px 12px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; font-family: SFMono-Regular, Menlo, Monaco, monospace;">
+            <div>
+                <button type="submit" style="padding: 8px 16px; background: #1d3a8c; color: white; border: none; border-radius: 4px; font-size: 13px; cursor: pointer;">Run</button>
+                <a href="?group={{.GroupMode}}" style="margin-left: 8px; padding: 8px 12px; font-size: 13px; color: #666; text-decoration: none;">Reset</a>
+                {{if or (eq "webhook-test" .SimulateMode) (eq "end-to-end" .SimulateMode)}}
+                <span style="margin-left: 12px; font-size: 12px; color: #9b2222;">:warning: This mode posts real messages to MM — pick a test channel.</span>
+                {{end}}
+            </div>
+        </form>
+
+        {{if .SimulateAction.Mode}}
+        <div style="margin-top: 16px; padding: 0; background: white; border-radius: 4px; border: 1px solid #ddd; overflow: hidden;">
+            {{if eq .SimulateAction.Mode "error"}}
+            <div style="padding: 12px 16px;">
+                <div style="font-weight: 600; color: #9b2222; margin-bottom: 8px;">:x: Action failed</div>
+                <div style="font-size: 13px;">{{.SimulateAction.Error}}</div>
+            </div>
+            {{else}}
+            <div style="padding: 10px 16px; background: #f2f3f5; font-weight: 600; font-size: 13px;">
+                {{if eq .SimulateAction.Mode "webhook-test"}}Webhook test results{{else}}End-to-end fire results{{end}}{{if .SimulateAction.Summary}} — {{.SimulateAction.Summary}}{{end}}
+            </div>
+            <table style="margin: 0;">
+                <thead>
+                    <tr><th style="width: 50%;">{{if eq .SimulateAction.Mode "webhook-test"}}Receiver{{else}}Runbook{{end}}</th><th style="width: 50%;">Result</th></tr>
+                </thead>
+                <tbody>
+                    {{range .SimulateAction.Items}}
+                    <tr>
+                        <td><code>{{.Name}}</code></td>
+                        <td>{{if .OK}}<span class="status ok">OK</span>{{else}}<span class="status bad">FAIL</span>{{end}} {{.Detail}}</td>
+                    </tr>
+                    {{end}}
+                </tbody>
+            </table>
+            {{end}}
+        </div>
+        {{end}}
+
+        {{if .SimulateMatrix}}
+        <div style="margin-top: 16px; padding: 0; background: white; border-radius: 4px; border: 1px solid #ddd; overflow: hidden;">
+            <div style="padding: 10px 16px; background: #f2f3f5; font-weight: 600; font-size: 13px;">
+                Coverage matrix — every shipped runbook simulated{{if .SimulateSeverity}} with <code>severity={{.SimulateSeverity}}</code>{{end}}{{if .SimulateExtra}} plus <code>{{.SimulateExtra}}</code>{{end}}
+            </div>
+            <table style="margin: 0;">
+                <thead>
+                    <tr><th style="width: 35%;">Runbook</th><th style="width: 65%;">Would dispatch to</th></tr>
+                </thead>
+                <tbody>
+                    {{range .SimulateMatrix}}
+                    <tr>
+                        <td><code>{{.MatrixRow}}</code></td>
+                        <td>
+                            {{if eq .Mode "ok"}}
+                                {{range .Receivers}}<code>{{.}}</code> {{end}}
+                            {{else if eq .Mode "fell-through"}}
+                                <span class="status warn">fell through</span> default: <code>{{.DefaultRx}}</code>
+                            {{else if eq .Mode "error"}}
+                                <span class="status bad">error</span> {{.Message}}
+                            {{end}}
+                        </td>
+                    </tr>
+                    {{end}}
+                </tbody>
+            </table>
+        </div>
+        {{end}}
+
+        {{if .SimulateResult.Mode}}
+        <div style="margin-top: 16px; padding: 12px 16px; background: white; border-radius: 4px; border: 1px solid #ddd;">
+            {{if eq .SimulateResult.Mode "ok"}}
+                <div style="font-weight: 600; color: #16753a; margin-bottom: 8px;">:white_check_mark: Would dispatch to {{len .SimulateResult.Receivers}} receiver(s)</div>
+                <div style="font-size: 12px; color: #666; margin-bottom: 8px;">Against Alertmanager: <code>{{.SimulateResult.AMURL}}</code></div>
+                <div style="font-size: 13px; margin-bottom: 4px;"><strong>Receivers:</strong></div>
+                <ul style="margin: 0 0 8px 16px; padding: 0;">
+                    {{range .SimulateResult.Receivers}}<li><code>{{.}}</code></li>{{end}}
+                </ul>
+            {{else if eq .SimulateResult.Mode "fell-through"}}
+                <div style="font-weight: 600; color: #8a5a00; margin-bottom: 8px;">:warning: No sub-route matched — alert would fall through to default</div>
+                <div style="font-size: 12px; color: #666; margin-bottom: 8px;">Against Alertmanager: <code>{{.SimulateResult.AMURL}}</code></div>
+                <div style="font-size: 13px;"><strong>Default receiver:</strong> <code>{{.SimulateResult.DefaultRx}}</code></div>
+                <div style="font-size: 12px; color: #666; margin-top: 8px;">If you expected this alert to hit a specific runbook receiver, check that your rule emits the <code>runbook=&lt;slug&gt;</code> label (or whatever label your <code>route.routes[].matchers:</code> block keys on).</div>
+            {{else if eq .SimulateResult.Mode "error"}}
+                <div style="font-weight: 600; color: #9b2222; margin-bottom: 8px;">:x: Simulation failed</div>
+                <div style="font-size: 13px;">{{.SimulateResult.Message}}</div>
+            {{end}}
+            {{if .SimulateResult.Labels}}
+            <div style="font-size: 12px; color: #666; margin-top: 8px;"><strong>Input labels:</strong>
+                {{range $k, $v := .SimulateResult.Labels}}<code>{{$k}}={{$v}}</code> {{end}}
+            </div>
+            {{end}}
+        </div>
+        {{end}}
+    </div>
+
     <div class="legend">
         <div class="row"><span class="status ok">OK</span><span class="desc">Receiver is loaded in AM and AM is reachable.</span></div>
         <div class="row"><span class="status warn">Not in AM YAML</span><span class="desc">Receiver in plugin config but missing from AM's loaded config (paste the latest receivers.yml + reload AM).</span></div>
@@ -546,6 +1271,97 @@ var inventoryTemplate = template.Must(template.New("inventory").Parse(`<!DOCTYPE
                 }
             });
         });
+
+        // Two-stage cascade for the route tester form.
+        //
+        // Stage 1: Type → Value. When the admin picks Type=group,
+        // the Value dropdown swaps to the list of groups. Type=individual
+        // → list of runbook slugs. Type=all → Value is disabled
+        // (irrelevant; the whole runbook set is the target).
+        //
+        // Stage 2: (Type, Value) → Channel. Only channels with at
+        // least one receiver matching the chosen (type, value) get
+        // shown. Empty selection or "all" type → every channel with
+        // any plugin receiver.
+        //
+        // All three dropdowns preserve their server-rendered initial
+        // values across the cascade so a deep-linked form (bookmarked
+        // ?simulate_type=...&simulate_value=...&simulate_channel=...)
+        // loads with the picks intact.
+        const targetChannels = {{.TargetChannelsJSON}};
+        const allGroups = {{.GroupOptionsJSON}};
+        const allSlugs = {{.RunbookSlugsJSON}};
+        const initialType = {{.SimulateType | printf "%q"}};
+        const initialValue = {{.SimulateValue | printf "%q"}};
+        const initialChannel = {{.SimulateChannel | printf "%q"}};
+
+        const typeSel = document.querySelector('select[name="simulate_type"]');
+        const valueSel = document.querySelector('select[name="simulate_value"]');
+        const channelSel = document.querySelector('select[name="simulate_channel"]');
+
+        function refreshValueOptions() {
+            if (!typeSel || !valueSel) return;
+            const t = typeSel.value;
+            const desired = valueSel.value || initialValue;
+            let opts;
+            if (t === "all") {
+                opts = '<option value="">(no further selection)</option>';
+                valueSel.disabled = true;
+            } else if (t === "group") {
+                opts = '<option value="">(pick a group)</option>';
+                for (const g of allGroups) {
+                    const sel = g === desired ? ' selected' : '';
+                    opts += '<option value="' + g + '"' + sel + '>' + g + '</option>';
+                }
+                valueSel.disabled = false;
+            } else if (t === "individual") {
+                opts = '<option value="">(pick a runbook)</option>';
+                for (const s of allSlugs) {
+                    const sel = s === desired ? ' selected' : '';
+                    opts += '<option value="' + s + '"' + sel + '>' + s + '</option>';
+                }
+                valueSel.disabled = false;
+            } else {
+                opts = '<option value="">(pick type first)</option>';
+                valueSel.disabled = true;
+            }
+            valueSel.innerHTML = opts;
+        }
+
+        function computeTargetKey() {
+            if (!typeSel || !valueSel) return "";
+            const t = typeSel.value;
+            if (t === "all") return "all";
+            if (t === "group" && valueSel.value) return "group:" + valueSel.value;
+            if (t === "individual" && valueSel.value) return "individual:" + valueSel.value;
+            return "";
+        }
+
+        function refreshChannelOptions() {
+            if (!channelSel) return;
+            const key = computeTargetKey();
+            const channels = (targetChannels[key] || targetChannels[""] || []);
+            const desired = channelSel.value || initialChannel;
+            let opts = '<option value="">(any channel)</option>';
+            for (const c of channels) {
+                const sel = c === desired ? ' selected' : '';
+                opts += '<option value="' + c + '"' + sel + '>' + c + '</option>';
+            }
+            channelSel.innerHTML = opts;
+        }
+
+        if (typeSel && valueSel && channelSel) {
+            typeSel.addEventListener('change', function() {
+                refreshValueOptions();
+                refreshChannelOptions();
+            });
+            valueSel.addEventListener('change', refreshChannelOptions);
+            // Initial render — restore server-rendered values, then
+            // populate downstream dropdowns based on them.
+            if (initialType) typeSel.value = initialType;
+            refreshValueOptions();
+            refreshChannelOptions();
+        }
     </script>
 </body>
 </html>

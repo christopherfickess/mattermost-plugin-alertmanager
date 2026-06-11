@@ -1,33 +1,72 @@
 # Sample Prometheus alert rules covering all 20 canonical runbooks
 # shipped by the mattermost-plugin-alertmanager plugin.
 #
-# How this file maps to the plugin
+# WHERE THIS FILE LIVES
+# ---------------------
+# In the plugin source: samples/prometheus-rules.yaml
+# In the plugin tarball: bundled under the same path.
+# To install: copy or symlink into a directory that matches the
+# `rule_files:` glob in your prometheus.yml, then reload Prometheus:
+#   curl -X POST http://prometheus:9090/-/reload
+#
+# HOW TO VALIDATE THESE RULES BEFORE TRUSTING THEM
+# -------------------------------------------------
+# 1. Syntax: `promtool check rules prometheus-rules.yaml`
+# 2. Routing: in any Mattermost channel with plugin receivers, run
+#    `/alertmanager validate --simulate runbook=high-cpu-usage` (or
+#    any other slug). The plugin walks Alertmanager's loaded route
+#    tree against those labels and reports which receiver an alert
+#    with that label set would actually dispatch to. Useful for
+#    catching dead routes BEFORE the rule fires for real.
+# 3. End-to-end: pick one rule, lower its threshold so it fires
+#    immediately, watch the bound channel for delivery, then revert.
+#
+# HOW THIS FILE MAPS TO THE PLUGIN
 # --------------------------------
 # Each rule below emits a `runbook: <slug>` label. The plugin's
 # /alertmanager add command creates Alertmanager receivers named
 # `<slug>--<channel>` and a matching routes block that matches on
-# the `runbook` label. So an alert with `runbook: high-cpu-usage`
-# fires into receivers like `high-cpu-usage--alerts` and gets
-# delivered to the bound Mattermost channel.
+# the `runbook` label. An alert with `runbook: high-cpu-usage`
+# fires into receivers like `high-cpu-usage--alerts` and lands in
+# the bound Mattermost channel.
 #
-# What you need to adjust before this is production-ready
+# LABEL CONTRACT WITH THE RUNBOOKS
+# --------------------------------
+# Each runbook's `## Required Prometheus labels` section names the
+# labels its Quick diagnostics commands need to render with
+# pre-filled values (vs `<no value>` placeholders). The expressions
+# below are written to emit those labels — verified runbook-by-runbook
+# against each footer. Where the underlying metric doesn't carry a
+# required label natively, an inline comment names the kube-state-
+# metrics join or relabel needed to produce it.
+#
+# Stack assumed below:
+# - kube-state-metrics (for pod / deployment / node phase metrics)
+# - cadvisor (for container_*  CPU and memory metrics)
+# - node_exporter (for node_filesystem_* / node_memory_*)
+# - blackbox_exporter (for probe_*)
+# - kubelet (for kubelet_volume_stats_*)
+# - postgres_exporter / mysql_exporter (for pg_* / mysql_* metrics)
+# - nginx ingress controller (for nginx_ingress_*)
+#
+# WHAT YOU NEED TO ADJUST BEFORE THIS IS PRODUCTION-READY
 # -------------------------------------------------------
 # 1. Thresholds and `for:` durations — every value below is a
 #    placeholder calibrated for a small demo cluster. Real
 #    environments need thresholds tuned to traffic shape and SLOs.
-# 2. PromQL series names — labels like `kube_pod_status_phase`
-#    assume kube-state-metrics is installed and exporting under
-#    its default names. Adjust if your scrape config renames them.
+# 2. PromQL series names — assume kube-state-metrics, cadvisor, and
+#    node_exporter use upstream-default names. Adjust if your
+#    scrape config renames them via metric_relabel_configs.
 # 3. Severity labels — the plugin doesn't enforce severity routing
 #    out of the box. Add severity-based routes to alertmanager.yml
 #    if you want sev1 to page and sev2 to chat-only.
-# 4. The `runbook_url` annotation uses the plugin's built-in
-#    runbook-host helper. If your Mattermost SiteURL differs, the
-#    plugin renders the correct URL automatically — these sample
-#    rules just declare the slug, not the full URL.
+# 4. The `runbook_url` annotation is supplied automatically by the
+#    plugin via the runbook-host helper. These sample rules only
+#    declare the slug — the plugin renders the full URL based on
+#    your Mattermost SiteURL.
 #
-# Format is the standard Prometheus rule_files: format.
-# See https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/
+# Format is the standard Prometheus rule_files: format. See
+# https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/
 # for the schema. Drop this file into a `rule_files` glob in your
 # prometheus.yml.
 
@@ -38,33 +77,59 @@ groups:
   - name: compute
     interval: 30s
     rules:
+      # HighCPUUsage — labels required: namespace, pod.
+      # Container-level CPU as a fraction of the container's quota.
+      # `container=""` filters out the pod-level aggregate emitted
+      # by cadvisor (which would double-count). The 0.85 threshold
+      # is "container using > 85% of its CPU limit for 10m".
       - alert: HighCPUUsage
         expr: |
-          100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+          sum by (namespace, pod) (
+            rate(container_cpu_usage_seconds_total{container!="",container!="POD"}[5m])
+          )
+          /
+          sum by (namespace, pod) (
+            kube_pod_container_resource_limits{resource="cpu"}
+          ) > 0.85
         for: 10m
         labels:
           severity: warning
           category: compute
           runbook: high-cpu-usage
         annotations:
-          summary: "Node {{ $labels.instance }} CPU > 85% for 10m"
-          description: "Sustained high CPU may indicate runaway processes, undersized nodes, or a noisy-neighbor pod."
+          summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} CPU > 85% of limit for 10m"
+          description: "Sustained high CPU may indicate runaway processes, undersized limits, or a noisy-neighbor pod."
 
+      # HighMemoryUsage — labels required: namespace, pod.
+      # Working-set memory as a fraction of the container's limit.
+      # Working-set is the closest proxy to "what counts against OOM
+      # killer" — RSS plus active page cache, minus inactive cache.
       - alert: HighMemoryUsage
         expr: |
-          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+          sum by (namespace, pod) (
+            container_memory_working_set_bytes{container!="",container!="POD"}
+          )
+          /
+          sum by (namespace, pod) (
+            kube_pod_container_resource_limits{resource="memory"}
+          ) > 0.90
         for: 10m
         labels:
           severity: warning
           category: compute
           runbook: high-memory-usage
         annotations:
-          summary: "Node {{ $labels.instance }} memory > 90% for 10m"
+          summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} memory > 90% of limit for 10m"
           description: "High memory pressure can trigger OOM kills and degrade scheduler behavior."
 
+      # PodCrashLoopBackOff — labels required: namespace, pod.
+      # kube_pod_container_status_restarts_total has `container` too;
+      # sum it away so the alert fires per-pod not per-container.
       - alert: PodCrashLoopBackOff
         expr: |
-          rate(kube_pod_container_status_restarts_total[5m]) * 60 * 5 > 3
+          sum by (namespace, pod) (
+            rate(kube_pod_container_status_restarts_total[5m])
+          ) * 60 * 5 > 3
         for: 5m
         labels:
           severity: critical
@@ -74,6 +139,8 @@ groups:
           summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} restarting > 3x in 5m"
           description: "Crashlooping pods indicate a bad image, missing config, or failing liveness probe."
 
+      # PodNotReady — labels required: namespace, pod.
+      # `condition="false"` series is 1 when the pod is NotReady.
       - alert: PodNotReady
         expr: |
           sum by (namespace, pod) (kube_pod_status_ready{condition="false"}) > 0
@@ -86,18 +153,32 @@ groups:
           summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} not Ready for 10m"
           description: "Pod has been in NotReady state long enough to suggest a real problem, not a transient blip."
 
+      # DeploymentReplicasUnavailable — labels required: namespace, app.
+      # The base metric carries `namespace` and `deployment`. The
+      # runbook needs `app` (e.g., the value of app.kubernetes.io/name)
+      # so the diagnostic commands can query by app label. Join with
+      # kube_deployment_labels to pull `label_app` and relabel it
+      # via `label_replace` into a plain `app` label.
       - alert: DeploymentReplicasUnavailable
         expr: |
-          kube_deployment_status_replicas_unavailable > 0
+          label_replace(
+            (
+              kube_deployment_status_replicas_unavailable > 0
+            )
+            * on (namespace, deployment) group_left(label_app_kubernetes_io_name)
+            kube_deployment_labels,
+            "app", "$1", "label_app_kubernetes_io_name", "(.+)"
+          )
         for: 10m
         labels:
           severity: warning
           category: compute
           runbook: deployment-replicas-unavailable
         annotations:
-          summary: "Deployment {{ $labels.namespace }}/{{ $labels.deployment }} has unavailable replicas"
+          summary: "Deployment {{ $labels.namespace }}/{{ $labels.deployment }} (app={{ $labels.app }}) has unavailable replicas"
           description: "Desired replica count not met. Check pod events and scheduler / resource constraints."
 
+      # NodeNotReady — labels required: node.
       - alert: NodeNotReady
         expr: |
           kube_node_status_condition{condition="Ready",status="true"} == 0
@@ -116,57 +197,86 @@ groups:
   - name: application
     interval: 30s
     rules:
+      # HighHTTPErrorRate — labels required: namespace, service.
+      # http_requests_total is whatever your application emits;
+      # assume it carries `service` and `namespace` already (via
+      # Prometheus relabel from kubernetes_sd or app instrumentation).
+      # If your app only emits `service`, add `namespace` via
+      # metric_relabel_configs at scrape time.
       - alert: HighHTTPErrorRate
         expr: |
-          sum by (service) (rate(http_requests_total{code=~"5.."}[5m]))
-            / sum by (service) (rate(http_requests_total[5m])) > 0.05
+          sum by (namespace, service) (rate(http_requests_total{code=~"5.."}[5m]))
+            / sum by (namespace, service) (rate(http_requests_total[5m])) > 0.05
         for: 5m
         labels:
           severity: critical
           category: application
           runbook: high-http-error-rate
         annotations:
-          summary: "Service {{ $labels.service }} 5xx rate > 5% for 5m"
+          summary: "Service {{ $labels.namespace }}/{{ $labels.service }} 5xx rate > 5% for 5m"
           description: "Sustained 5xx errors indicate a real availability incident, not a single bad request."
 
+      # HighAPILatency — labels required: namespace, app.
+      # Grouping by `app` matches what the runbook's kubectl
+      # commands query (`-l app=<app>`). Assumes the
+      # http_request_duration_seconds metric carries an `app`
+      # label — most instrumentation libraries (prometheus-client,
+      # otel) let you set this via constant labels.
       - alert: HighAPILatency
         expr: |
-          histogram_quantile(0.95, sum by (service, le) (rate(http_request_duration_seconds_bucket[5m]))) > 1.0
+          histogram_quantile(0.95,
+            sum by (namespace, app, le) (rate(http_request_duration_seconds_bucket[5m]))
+          ) > 1.0
         for: 10m
         labels:
           severity: warning
           category: application
           runbook: high-api-latency
         annotations:
-          summary: "Service {{ $labels.service }} p95 latency > 1s for 10m"
+          summary: "Service {{ $labels.namespace }}/{{ $labels.app }} p95 latency > 1s for 10m"
           description: "Tail latency degradation. Check downstream dependencies and DB query times."
 
+      # ServiceEndpointDown — labels required: namespace, service.
+      # blackbox_exporter's probe_success is keyed by `instance`.
+      # To produce namespace/service, configure the blackbox scrape
+      # to relabel from kubernetes_sd_configs:
+      #   metric_relabel_configs:
+      #     - source_labels: [__meta_kubernetes_service_namespace]
+      #       target_label: namespace
+      #     - source_labels: [__meta_kubernetes_service_name]
+      #       target_label: service
+      # Once those labels exist on probe_success, this rule fires
+      # per-service rather than per-probe-target URL.
       - alert: ServiceEndpointDown
         expr: |
-          probe_success == 0
+          max by (namespace, service) (probe_success == 0)
         for: 5m
         labels:
           severity: critical
           category: application
           runbook: service-endpoint-down
         annotations:
-          summary: "Probe target {{ $labels.instance }} down for 5m"
+          summary: "Service {{ $labels.namespace }}/{{ $labels.service }} probe failing for 5m"
           description: "Synthetic probe failing — either the service is dead or the network path is broken."
 
+      # RequestRateAnomaly — labels required: namespace, service.
+      # Compares current 5m rate against same-time-yesterday's 5m rate.
+      # `offset 1h` is short for demo purposes; switch to `offset 1d`
+      # to compare against weekly seasonality in production.
       - alert: RequestRateAnomaly
         expr: |
           abs(
-            sum by (service) (rate(http_requests_total[5m]))
-            - sum by (service) (rate(http_requests_total[5m] offset 1h))
+            sum by (namespace, service) (rate(http_requests_total[5m]))
+            - sum by (namespace, service) (rate(http_requests_total[5m] offset 1h))
           )
-            / sum by (service) (rate(http_requests_total[5m] offset 1h)) > 0.5
+            / sum by (namespace, service) (rate(http_requests_total[5m] offset 1h)) > 0.5
         for: 15m
         labels:
           severity: warning
           category: application
           runbook: request-rate-anomaly
         annotations:
-          summary: "Service {{ $labels.service }} request rate diverges >50% from same-time-yesterday"
+          summary: "Service {{ $labels.namespace }}/{{ $labels.service }} request rate diverges >50% from one hour ago"
           description: "Could be traffic loss (upstream broken) or a sudden surge (DDoS, viral content, retry storm)."
 
   # =========================================================
@@ -175,6 +285,14 @@ groups:
   - name: database
     interval: 30s
     rules:
+      # DatabaseConnectivityLoss — labels required: instance, namespace, app.
+      # The base `up` series is per-(instance, job). `namespace` and
+      # `app` come from the application side — the metric used here
+      # (pg_up via postgres_exporter) only carries `instance`. The
+      # runbook's `app` and `namespace` placeholders refer to the
+      # CONNECTING application, not the DB itself. Set these via
+      # static rule labels if you scope this rule per-team, or via
+      # metric_relabel_configs that pull from your service catalog.
       - alert: DatabaseConnectivityLoss
         expr: |
           up{job=~".*postgres.*|.*mysql.*"} == 0
@@ -187,6 +305,9 @@ groups:
           summary: "Database {{ $labels.instance }} unreachable for 2m"
           description: "DB exporter cannot scrape the DB. Check the DB process, networking, and credentials."
 
+      # DatabaseReplicationLag — labels required: instance.
+      # pg_replication_lag_seconds from postgres_exporter naturally
+      # carries `instance` (the replica being measured).
       - alert: DatabaseReplicationLag
         expr: |
           pg_replication_lag_seconds > 30
@@ -199,16 +320,22 @@ groups:
           summary: "Postgres replica {{ $labels.instance }} lag > 30s for 5m"
           description: "Replica is behind primary. Risk of stale reads and increased failover RPO."
 
+      # DatabaseHighLatency — labels required: instance.
+      # Aggregate by instance so each DB host fires independently —
+      # a single laggy replica shouldn't be hidden by a healthy
+      # primary's faster median.
       - alert: DatabaseHighLatency
         expr: |
-          histogram_quantile(0.95, sum by (le) (rate(pg_stat_statements_mean_time_seconds_bucket[5m]))) > 0.5
+          histogram_quantile(0.95,
+            sum by (instance, le) (rate(pg_stat_statements_mean_time_seconds_bucket[5m]))
+          ) > 0.5
         for: 10m
         labels:
           severity: warning
           category: database
           runbook: database-high-latency
         annotations:
-          summary: "Postgres p95 query time > 500ms for 10m"
+          summary: "Postgres {{ $labels.instance }} p95 query time > 500ms for 10m"
           description: "Slow queries usually mean missing indexes, table bloat, or a noisy-neighbor workload."
 
   # =========================================================
@@ -217,18 +344,31 @@ groups:
   - name: storage
     interval: 30s
     rules:
+      # PersistentVolumeFull — labels required: namespace, pod.
+      # kubelet_volume_stats_* carries `namespace` and
+      # `persistentvolumeclaim`. To resolve PVC → pod, join with
+      # kube_pod_spec_volumes_persistentvolumeclaims_info which
+      # carries `namespace`, `persistentvolumeclaim`, and `pod`.
       - alert: PersistentVolumeFull
         expr: |
-          (kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes) * 100 > 90
+          (
+            kubelet_volume_stats_used_bytes
+              / kubelet_volume_stats_capacity_bytes * 100
+          ) * on (namespace, persistentvolumeclaim) group_left(pod)
+          kube_pod_spec_volumes_persistentvolumeclaims_info > 90
         for: 5m
         labels:
           severity: critical
           category: storage
           runbook: persistent-volume-full
         annotations:
-          summary: "PV {{ $labels.persistentvolumeclaim }} > 90% full"
+          summary: "PVC {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} (pod {{ $labels.pod }}) > 90% full"
           description: "Volume close to capacity. Expand the PVC or clean up data before writes start failing."
 
+      # DiskFillRateHigh — labels required: instance.
+      # node_filesystem_avail_bytes naturally carries `instance`,
+      # `mountpoint`, `device`, `fstype`. The mountpoint filter
+      # focuses on root — drop it to catch fills on all volumes.
       - alert: DiskFillRateHigh
         expr: |
           predict_linear(node_filesystem_avail_bytes{mountpoint="/"}[1h], 4 * 3600) < 0
@@ -247,6 +387,7 @@ groups:
   - name: networking
     interval: 30s
     rules:
+      # IngressHigh5xx — emits `ingress` (no runbook footer constraint).
       - alert: IngressHigh5xx
         expr: |
           sum by (ingress) (rate(nginx_ingress_controller_requests{status=~"5.."}[5m]))
@@ -260,6 +401,9 @@ groups:
           summary: "Ingress {{ $labels.ingress }} 5xx rate > 5% for 5m"
           description: "Ingress-level 5xx indicates upstream service failure or backend pool exhaustion."
 
+      # CertificateExpiringSoon — labels required: instance.
+      # probe_ssl_earliest_cert_expiry naturally carries `instance`
+      # (the probe target hostname:port).
       - alert: CertificateExpiringSoon
         expr: |
           (probe_ssl_earliest_cert_expiry - time()) / 86400 < 14
@@ -272,6 +416,10 @@ groups:
           summary: "TLS cert on {{ $labels.instance }} expires in < 14 days"
           description: "Lead time for renewal. Don't wait until the day-of."
 
+      # DnsResolutionFailure — emits `instance` (no runbook footer
+      # constraint). Uses blackbox probe DNS module + the generic
+      # probe_success series. Either lookup-time-zero (the probe
+      # didn't try) or probe_success=0 (it tried and failed) counts.
       - alert: DnsResolutionFailure
         expr: |
           probe_dns_lookup_time_seconds == 0 or probe_success{job="dns"} == 0
@@ -290,6 +438,13 @@ groups:
   - name: observability
     interval: 30s
     rules:
+      # PrometheusScrapeTargetDown — labels required: namespace, service.
+      # `up == 0` per-target. Under kubernetes_sd_configs the scrape
+      # config will (with default kubernetes-sd relabel rules) attach
+      # __meta_kubernetes_service_namespace and
+      # __meta_kubernetes_service_name — surface those as `namespace`
+      # and `service` via relabel_configs at scrape time so this rule
+      # produces the labels the runbook expects.
       - alert: PrometheusScrapeTargetDown
         expr: |
           up == 0
@@ -299,9 +454,10 @@ groups:
           category: observability
           runbook: prometheus-scrape-target-down
         annotations:
-          summary: "Prometheus cannot scrape {{ $labels.job }}/{{ $labels.instance }} for 5m"
+          summary: "Prometheus cannot scrape {{ $labels.namespace }}/{{ $labels.service }} ({{ $labels.job }}/{{ $labels.instance }}) for 5m"
           description: "Missing scrape target = blind to that subsystem. Either the target is dead or the scrape config is wrong."
 
+      # AlertmanagerNotificationFailure — emits `receiver` natively.
       - alert: AlertmanagerNotificationFailure
         expr: |
           rate(alertmanager_notifications_failed_total[5m]) > 0

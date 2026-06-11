@@ -28,7 +28,7 @@ const (
 		"- `/alertmanager rotate <name>` — delete + recreate the webhook (new hook-id, new URL)\n" +
 		"- `/alertmanager silences` — list active silences (grouped by Alertmanager URL)\n" +
 		"- `/alertmanager status` — Alertmanager version + uptime per backend (grouped by Alertmanager URL)\n" +
-		"- `/alertmanager validate [name|set] [--webhook-test] [--end-to-end]` — validate pipeline configuration: AM reach, receiver loaded in AM, optional synthetic delivery"
+		"- `/alertmanager validate [name|set] [--webhook-test|--end-to-end|--simulate <labels>]` — validate pipeline configuration. Without flags: AM reach + receiver-loaded-in-AM. `--webhook-test` / `--end-to-end` fire side-effect tests. `--simulate runbook=<slug> severity=<level>` walks AM's loaded route tree against the labels and reports which receiver(s) an alert with those labels would dispatch to (read-only, no synthetic alert)."
 )
 
 // getCommand returns the model.Command registration. Autocomplete data
@@ -149,7 +149,7 @@ func getAutocompleteData() *model.AutocompleteData {
 
 	root.AddCommand(model.NewAutocompleteData("status", "", "Alertmanager version + uptime per backend (grouped by Alertmanager URL)"))
 
-	validate := model.NewAutocompleteData("validate", "[name|set] [--webhook-test] [--end-to-end]", "Validate pipeline configuration — checks AM reach + receiver loaded in AM (sysadmin/team_admin)")
+	validate := model.NewAutocompleteData("validate", "[name|set] [--webhook-test|--end-to-end|--simulate <labels>]", "Validate pipeline configuration — checks AM reach + receiver loaded in AM, or simulates route resolution with --simulate (sysadmin/team_admin)")
 	validate.AddStaticListArgument("Pick a set to limit the check, OR type a receiver name", false, []model.AutocompleteListItem{
 		{Item: "all", HelpText: "Every receiver bound to this channel (default)"},
 		{Item: "application", HelpText: "Application receivers only"},
@@ -159,9 +159,10 @@ func getAutocompleteData() *model.AutocompleteData {
 		{Item: "observability", HelpText: "Observability receivers only"},
 		{Item: "storage", HelpText: "Storage receivers only"},
 	})
-	validate.AddStaticListArgument("Optional flags to add side-effect tests", false, []model.AutocompleteListItem{
+	validate.AddStaticListArgument("Optional flag — pick a side-effect test or simulate route resolution", false, []model.AutocompleteListItem{
 		{Item: "--webhook-test", HelpText: "Also POST a visible test message to each receiver's webhook"},
 		{Item: "--end-to-end", HelpText: "Also fire a synthetic alert through Alertmanager; watch the channel for delivery"},
+		{Item: "--simulate", HelpText: "Walk AM's loaded route tree against a label set you supply. Type `key=value` pairs after the flag (e.g., `--simulate runbook=high-cpu-usage severity=critical`). Read-only — no synthetic alert is fired, safe to run repeatedly."},
 	})
 	root.AddCommand(validate)
 

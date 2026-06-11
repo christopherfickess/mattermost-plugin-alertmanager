@@ -471,19 +471,60 @@ func (p *Plugin) handleList(args *model.CommandArgs) (string, error) {
 		return emptyScopeMessage("list"), nil
 	}
 
+	cfg := p.getConfiguration()
+	threshold := time.Duration(cfg.WebhookRotationDays) * 24 * time.Hour
+	now := time.Now()
+
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("**%d receiver(s) bound to this channel:**\n\n", len(configs)))
-	b.WriteString("| Name | Team | Channel | Alertmanager URL |\n")
-	b.WriteString("|------|------|---------|------------------|\n")
+	b.WriteString("| Name | Team | Channel | Alertmanager URL | Rotated |\n")
+	b.WriteString("|------|------|---------|------------------|---------|\n")
 	for _, c := range configs {
 		amURL := c.AlertManagerURL
 		if amURL == "" {
 			amURL = "_(none)_"
 		}
-		b.WriteString(fmt.Sprintf("| `%s` | `%s` | `~%s` | %s |\n", c.Name, c.Team, c.Channel, amURL))
+		// Overdue marker only when the per-receiver opt-in is on AND
+		// the global threshold > 0 AND the age exceeds the threshold.
+		// All three are required — otherwise the reminder system itself
+		// wouldn't fire for this receiver, so flagging it as overdue in
+		// list output would mislead the operator.
+		overdue := c.RotationRemindersEnabled && cfg.WebhookRotationDays > 0 &&
+			!c.LastRotatedAt.IsZero() && now.Sub(c.LastRotatedAt) > threshold
+		b.WriteString(fmt.Sprintf("| `%s` | `%s` | `~%s` | %s | %s |\n",
+			c.Name, c.Team, c.Channel, amURL,
+			formatRotationAge(c.LastRotatedAt, now, overdue)))
 	}
 	b.WriteString("\n_Full details (and the slack_configs YAML) for one receiver: `/alertmanager config <name>`_\n")
+	if cfg.WebhookRotationDays > 0 {
+		b.WriteString(fmt.Sprintf("_Rotation threshold: %d days (System Console → WebhookRotationDays). ⚠️ = past threshold + opted in to reminders._\n", cfg.WebhookRotationDays))
+	}
 	return b.String(), nil
+}
+
+// formatRotationAge turns a LastRotatedAt timestamp into a short
+// human label for the list view. Zero value → "never" (pre-rotation
+// or pre-feature receiver). < 24h → "today". < 48h → "yesterday".
+// Older → "N days ago". The ⚠️ prefix lands only when the caller has
+// already determined this receiver is past its rotation threshold —
+// formatting doesn't re-derive that decision.
+func formatRotationAge(t, now time.Time, overdue bool) string {
+	prefix := ""
+	if overdue {
+		prefix = "⚠️ "
+	}
+	if t.IsZero() {
+		return prefix + "never"
+	}
+	age := now.Sub(t)
+	switch {
+	case age < 24*time.Hour:
+		return prefix + "today"
+	case age < 48*time.Hour:
+		return prefix + "yesterday"
+	default:
+		return fmt.Sprintf("%s%d days ago", prefix, int(age/(24*time.Hour)))
+	}
 }
 
 // handleConfig renders the full detail card for one receiver bound to

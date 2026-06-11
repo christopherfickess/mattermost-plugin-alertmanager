@@ -6,11 +6,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/christopherfickess/mattermost-plugin-alertmanager/server/alertmanager"
 	"github.com/mattermost/mattermost/server/public/model"
+	pmodel "github.com/prometheus/common/model"
+
+	amconfig "github.com/prometheus/alertmanager/config"
+	"github.com/prometheus/alertmanager/dispatch"
 )
 
 // cmd_validate.go owns /alertmanager validate — an end-to-end diagnostic
@@ -53,6 +58,15 @@ func (p *Plugin) handleValidate(args *model.CommandArgs) (string, error) {
 
 	fields := strings.Fields(args.Command)
 	rest := fields[2:]
+
+	// --simulate is a sub-mode of validate: instead of probing real
+	// receivers, walk the AM route tree with the given label set and
+	// report which receivers an alert with those labels would actually
+	// dispatch to. Everything AFTER --simulate is the label list, so
+	// extract it first and short-circuit the regular validate path.
+	if idx := indexOfFlag(rest, "--simulate"); idx >= 0 {
+		return p.handleValidateSimulate(args, rest[idx+1:])
+	}
 
 	webhookTest := containsFlag(rest, "--webhook-test")
 	endToEnd := containsFlag(rest, "--end-to-end")
@@ -166,7 +180,7 @@ func (p *Plugin) handleValidate(args *model.CommandArgs) (string, error) {
 
 		// (d) End-to-end alert via AM — opt-in
 		if endToEnd && st.ok {
-			alertID, err := postValidateSyntheticAlert(c.AlertManagerURL, receiverBaseSlug(c.Name))
+			alertID, err := postValidateSyntheticAlert(c.AlertManagerURL, receiverBaseSlug(c.Name), "", nil)
 			if err != nil {
 				r.EndToEndAlertID = "✗ " + err.Error()
 			} else {
@@ -228,6 +242,163 @@ func (p *Plugin) handleValidate(args *model.CommandArgs) (string, error) {
 func isKnownSet(name string) bool {
 	slugs, ok := scaffoldSets[name]
 	return ok && slugs != nil
+}
+
+// handleValidateSimulate walks AM's loaded route tree against a
+// supplied label set and reports which receiver(s) would actually
+// receive a real alert carrying those labels. Mirrors the semantics
+// of `amtool config routes test` — the question is "given my
+// Prometheus rule's labels, where would the resulting alert land?"
+//
+// With no label args, prints a preset list (one common runbook per
+// line) so the operator has copy-pasteable starting points instead
+// of staring at "Usage: ...". Empty arglist is a discoverability
+// path, not an error.
+//
+// Reads AM's loaded config from the cached probe (no fresh HTTP
+// call needed unless the cache is stale — same path
+// /alertmanager validate's loaded-in-AM check uses).
+func (p *Plugin) handleValidateSimulate(args *model.CommandArgs, simulateArgs []string) (string, error) {
+	scoped := p.configsForCurrentChannel(args)
+	if len(scoped) == 0 {
+		return ":information_source: No receivers bound to this channel — can't simulate routing without a backing Alertmanager.", nil
+	}
+
+	if len(simulateArgs) == 0 {
+		return formatSimulatePresets(), nil
+	}
+
+	labels, parseErr := parseSimulateLabels(simulateArgs)
+	if parseErr != nil {
+		return fmt.Sprintf(":x: %v\n\nUsage: `/alertmanager validate --simulate <key>=<value> [<key>=<value> ...]`\n\nExample: `/alertmanager validate --simulate runbook=high-cpu-usage severity=warning`", parseErr), nil
+	}
+
+	// Same-AM assumption: all receivers in a channel point at one AM
+	// (the inventory page enforces this implicitly). Pick the first
+	// receiver's AM URL; if a channel actually has receivers across
+	// multiple AMs, we'd want a per-AM simulation — out of scope here.
+	amURL := scoped[0].AlertManagerURL
+	entry := p.probeAMReachability(amURL)
+	if !entry.Reachable {
+		return fmt.Sprintf(":x: Alertmanager at `%s` is unreachable (%s). Can't simulate without a live config.", amURL, entry.Status), nil
+	}
+	if entry.ConfigBody == "" {
+		return fmt.Sprintf(":x: Alertmanager at `%s` responded but didn't return its loaded config in /api/v2/status (older AM version?). Can't simulate without it.", amURL), nil
+	}
+
+	cfg, err := amconfig.Load(entry.ConfigBody)
+	if err != nil {
+		return fmt.Sprintf(":x: AM's loaded config doesn't parse: `%v`. Simulation is unreliable on broken configs.", err), nil
+	}
+	if cfg.Route == nil {
+		return ":x: AM's loaded config has no `route:` block — nothing to simulate.", nil
+	}
+
+	mainRoute := dispatch.NewRoute(cfg.Route, nil)
+	matches := mainRoute.Match(labels)
+
+	var b strings.Builder
+	b.WriteString(":mag: **Route simulation result**\n\n")
+	b.WriteString(fmt.Sprintf("Against Alertmanager: `%s`\n\n", amURL))
+	b.WriteString("**Input alert labels:**\n")
+	// Render labels in sorted key order so the same input always
+	// produces the same output (label maps iterate randomly otherwise).
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, string(k))
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(&b, "- `%s` = `%s`\n", k, string(labels[pmodel.LabelName(k)]))
+	}
+	b.WriteString("\n")
+
+	if len(matches) == 0 {
+		b.WriteString(":warning: **NO sub-routes matched.** Alert would fall through to the default receiver:\n\n")
+		fmt.Fprintf(&b, "- `%s`\n\n", cfg.Route.Receiver)
+		b.WriteString("If you expected this alert to hit a specific runbook receiver, check that your rule emits the `runbook=<slug>` label (or whatever label your `route.routes[].matchers:` block keys on).")
+		return b.String(), nil
+	}
+
+	fmt.Fprintf(&b, "**Would dispatch to %d receiver(s):**\n", len(matches))
+	for _, m := range matches {
+		fmt.Fprintf(&b, "- `%s`\n", m.RouteOpts.Receiver)
+	}
+
+	// Cross-check: do those receivers exist in AM's loaded config?
+	// In principle they should (we just parsed it), but AM allows
+	// routes that reference undefined receivers in some edge cases.
+	loaded := extractAMReceiverNames(entry.ConfigBody)
+	loadedSet := make(map[string]bool, len(loaded))
+	for _, n := range loaded {
+		loadedSet[n] = true
+	}
+	for _, m := range matches {
+		if !loadedSet[string(m.RouteOpts.Receiver)] {
+			fmt.Fprintf(&b, "\n:warning: Receiver `%s` is referenced by a route but NOT defined in AM's receivers list — alerts dispatched to it will fail. Fix the receiver definition or the route's `receiver:` field.\n", m.RouteOpts.Receiver)
+		}
+	}
+
+	return b.String(), nil
+}
+
+// parseSimulateLabels turns CLI-style `key=value` args into a
+// Prometheus label set. Validates each pair and returns a clear
+// error on malformed input — operators typing this at 3am benefit
+// from "got `foo` (no `=`)" over a generic parse failure.
+func parseSimulateLabels(args []string) (pmodel.LabelSet, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("no labels supplied")
+	}
+	ls := pmodel.LabelSet{}
+	for _, a := range args {
+		eq := strings.IndexByte(a, '=')
+		if eq < 1 || eq == len(a)-1 {
+			return nil, fmt.Errorf("invalid label %q (expected `key=value`)", a)
+		}
+		name := pmodel.LabelName(a[:eq])
+		value := pmodel.LabelValue(a[eq+1:])
+		if !name.IsValid() {
+			return nil, fmt.Errorf("invalid label name %q (must match Prometheus label name rules: starts with [A-Za-z_], rest [A-Za-z0-9_])", a[:eq])
+		}
+		ls[name] = value
+	}
+	return ls, nil
+}
+
+// formatSimulatePresets returns a list of runbook-slug starter
+// expressions the operator can copy-paste. Discovered from the
+// embedded runbook list — kept in sync with whatever runbooks
+// ship in the plugin without a separate registry to maintain.
+func formatSimulatePresets() string {
+	slugs := runbookSlugs()
+	var b strings.Builder
+	b.WriteString(":mag: **Route simulation — pick a starter to try**\n\n")
+	b.WriteString("Run with one or more `key=value` labels to see which receiver an alert with those labels would route to. Use one of these runbook slugs as a starting point:\n\n")
+	b.WriteString("```\n")
+	for _, slug := range slugs {
+		fmt.Fprintf(&b, "/alertmanager validate --simulate runbook=%s\n", slug)
+	}
+	b.WriteString("```\n\n")
+	b.WriteString("Or supply your own label set with anything Prometheus emits:\n\n")
+	b.WriteString("- `/alertmanager validate --simulate severity=critical service=api-gateway`\n")
+	b.WriteString("- `/alertmanager validate --simulate alertname=PodCrashLoopBackOff namespace=billing`\n")
+	b.WriteString("- `/alertmanager validate --simulate runbook=high-cpu-usage severity=warning`\n\n")
+	b.WriteString("The simulation walks Alertmanager's currently-loaded route tree (fetched live via `/api/v2/status`) — no synthetic alert is actually fired, so this is safe to run as often as you want.")
+	return b.String()
+}
+
+// indexOfFlag returns the position of the named flag in args, or -1
+// if absent. Used by --simulate, where everything AFTER the flag is
+// the label list (key=value pairs) and we need to peel those off
+// from any preceding positionals.
+func indexOfFlag(args []string, flag string) int {
+	for i, a := range args {
+		if a == flag {
+			return i
+		}
+	}
+	return -1
 }
 
 // containsFlag returns true if the args list includes the exact flag.
@@ -361,18 +532,35 @@ func postValidateTestMessage(webhookURL, receiverName string) error {
 // We use a 30s-from-now `endsAt` so the alert auto-resolves quickly
 // and doesn't linger. labels include `test=validate` so it's
 // distinguishable from real traffic.
-func postValidateSyntheticAlert(amURL, runbookSlug string) (string, error) {
+//
+// severity defaults to "warning" when empty. extraLabels merge in
+// on top of the defaults — caller-supplied keys override the helper's
+// own (so e.g. a caller can override `alertname` or `severity` from
+// the admin form, but not the `test=validate` / `source=...` markers
+// since those are appended last to keep the synthetic-alert marker
+// authoritative).
+func postValidateSyntheticAlert(amURL, runbookSlug, severity string, extraLabels map[string]string) (string, error) {
+	if severity == "" {
+		severity = "warning"
+	}
+	labels := map[string]string{
+		"alertname": "ValidateSyntheticTest",
+		"runbook":   runbookSlug,
+	}
+	for k, v := range extraLabels {
+		labels[k] = v
+	}
+	// Markers come last so they always win — guarantees the alert is
+	// identifiable as synthetic even if a caller passed conflicting keys.
+	labels["severity"] = severity
+	labels["test"] = "validate"
+	labels["source"] = "alertmanager-plugin-validate"
+
 	startsAt := time.Now().UTC().Format(time.RFC3339)
 	endsAt := time.Now().Add(30 * time.Second).UTC().Format(time.RFC3339)
 	payload := []map[string]any{
 		{
-			"labels": map[string]string{
-				"alertname": "ValidateSyntheticTest",
-				"runbook":   runbookSlug,
-				"severity":  "warning",
-				"test":      "validate",
-				"source":    "alertmanager-plugin-validate",
-			},
+			"labels": labels,
 			"annotations": map[string]string{
 				"summary":     "Synthetic alert from /alertmanager validate",
 				"description": "This is a validate diagnostic — if you see this in the channel, AM → MM delivery works end-to-end. Auto-resolves in ~30 seconds.",

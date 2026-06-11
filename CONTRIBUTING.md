@@ -46,19 +46,35 @@ set. See `build/setup.mk` for the full env-var set.
 Each of the 20 receivers maps 1:1 to a Markdown file in `runbooks/`.
 To add a 21st:
 
-1. Drop the file at `runbooks/<slug>.md`. The slug must be lowercase
-   kebab-case and match the receiver name you want the plugin to use.
-2. Add the slug to the appropriate category in
+1. Copy [`runbooks/TEMPLATE.md`](runbooks/TEMPLATE.md) to
+   `runbooks/<slug>.md`. The slug must be lowercase kebab-case and
+   match the receiver name you want the plugin to use.
+2. Fill in the template. The `## Quick diagnostics` section is the
+   load-bearing one — the plugin extracts the first three fenced
+   code blocks and inlines them into every alert post. Each code
+   block must follow the **WHERE / WHAT / READ** convention:
+   - **WHERE** — exact tool and context (`shell with kubectl context
+     set`, `Grafana → Explore (Prometheus data source)`, `psql to
+     primary`, etc.). No ambiguity.
+   - **WHAT** — what the command does and the surrounding theory.
+     Why this query? What state does it surface?
+   - **READ** — concrete value interpretation. "0 = no throttling.
+     >0.1 = throttled 10%+ of the time, indicates CPU contention."
+     Plus the suggested next action if the value is bad.
+   Use the placeholder tokens `<namespace>`, `<pod>`, `<instance>`,
+   `<job>`, etc. where labels should be substituted at delivery
+   time — the plugin's renderer fills them from the alert's labels.
+3. Add the slug to the appropriate category in
    `server/cmd_scaffold.go` (the `scaffoldSets` map).
-3. Add a corresponding Prometheus alert rule to
+4. Add a corresponding Prometheus alert rule to
    `samples/prometheus-rules.yaml`. Set the rule's `runbook:` label
-   to the slug — that's how Alertmanager routes the alert.
-4. Run `go test ./...` and `make dist` to confirm the embedded
+   to the slug — that's how Alertmanager routes the alert. The
+   rule's emitted labels must cover what the runbook's diagnostic
+   commands reference (declared in the runbook's "Required labels"
+   footer).
+5. Run `go test ./...` and `make dist` to confirm the embedded
    runbook bundles and the new receiver is picked up by
    `/alertmanager add`.
-
-The runbook content itself follows the existing template: summary,
-diagnostic queries, mitigation steps, links to relevant dashboards.
 
 ## Commit conventions
 
