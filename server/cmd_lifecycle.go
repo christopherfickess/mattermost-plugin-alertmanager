@@ -69,6 +69,12 @@ func (p *Plugin) handleRemove(args *model.CommandArgs) (string, error) {
 // (high-cpu-usage). For short-name lookups, the receiver must be bound
 // to the current channel — disambiguates when the same slug exists in
 // multiple channels.
+//
+// Webhook refcount (v1.0.3+): if the removed receiver shares its
+// WebhookID with other receivers (group webhook), the webhook stays
+// alive. Only when the last receiver pointing at a webhook is removed
+// does the Mattermost incoming webhook get deleted. Order is
+// save-then-delete so a failed delete leaves no stale receiver entry.
 func (p *Plugin) handleRemoveOne(args *model.CommandArgs, name string) (string, error) {
 	current := p.getConfiguration().AlertConfigs
 	resolved := resolveReceiverName(current, name, args.ChannelId, p)
@@ -85,16 +91,54 @@ func (p *Plugin) handleRemoveOne(args *model.CommandArgs, name string) (string, 
 		return fmt.Sprintf("Receiver %q not found.", name), nil
 	}
 
-	if err := p.deleteIncomingWebhook(args.UserId, hookID); err != nil {
-		// Webhook delete failures don't block removal of our entry —
-		// admins can clean up the orphan webhook via System Console.
-		p.API.LogWarn("could not delete incoming webhook on removal (continuing)", "webhookID", hookID, "err", err.Error())
-	}
 	if err := p.saveConfigs(filtered); err != nil {
-		return fmt.Sprintf("Failed to persist config after webhook delete: %v", err), nil
+		return fmt.Sprintf("Failed to persist config: %v", err), nil
 	}
 
-	return fmt.Sprintf(":wastebasket: Removed receiver `%s`. Don't forget to delete the corresponding `slack_configs` block from `alertmanager.yml`.", name), nil
+	// Refcount: only delete the underlying webhook if no other receiver
+	// still depends on it.
+	if !webhookStillReferenced(filtered, hookID) {
+		if err := p.deleteIncomingWebhook(args.UserId, hookID); err != nil {
+			p.API.LogWarn("could not delete orphaned webhook on remove (continuing)", "webhookID", hookID, "err", err.Error())
+		}
+	}
+
+	return fmt.Sprintf(":wastebasket: Removed receiver `%s`. Don't forget to delete the corresponding `slack_configs` block from `alertmanager.yml`.", resolved), nil
+}
+
+// webhookStillReferenced returns true when at least one entry in the
+// supplied slice still references the given webhookID. The post-remove
+// caller uses this to decide whether to clean up the Mattermost webhook.
+func webhookStillReferenced(entries []alertConfig, webhookID string) bool {
+	for _, c := range entries {
+		if c.WebhookID == webhookID {
+			return true
+		}
+	}
+	return false
+}
+
+// orphanedWebhookIDs returns webhookIDs referenced by `before` but not
+// by `after`. Used after bulk-remove operations to identify webhooks
+// whose last receiver was just removed. Stable order — preserves the
+// order of first appearance in `before` so log output is deterministic.
+func orphanedWebhookIDs(before, after []alertConfig) []string {
+	afterRefs := make(map[string]bool, len(after))
+	for _, c := range after {
+		afterRefs[c.WebhookID] = true
+	}
+	seen := make(map[string]bool)
+	orphans := make([]string, 0)
+	for _, c := range before {
+		if seen[c.WebhookID] {
+			continue
+		}
+		seen[c.WebhookID] = true
+		if !afterRefs[c.WebhookID] {
+			orphans = append(orphans, c.WebhookID)
+		}
+	}
+	return orphans
 }
 
 // handleRemoveAll removes every receiver bound to the current channel.
@@ -134,16 +178,10 @@ func (p *Plugin) handleRemoveAll(args *model.CommandArgs, force bool) (string, e
 	current := p.getConfiguration().AlertConfigs
 	filtered := make([]alertConfig, 0, len(current))
 	removed := make([]string, 0, len(scoped))
-	webhookFailures := make([]string, 0)
 	for _, c := range current {
 		if !namesToRemove[c.Name] {
 			filtered = append(filtered, c)
 			continue
-		}
-		if err := p.deleteIncomingWebhook(args.UserId, c.WebhookID); err != nil {
-			p.API.LogWarn("remove-all: could not delete incoming webhook (config entry still pruned)",
-				"receiver", c.Name, "webhookID", c.WebhookID, "err", err.Error())
-			webhookFailures = append(webhookFailures, c.Name)
 		}
 		removed = append(removed, c.Name)
 	}
@@ -152,13 +190,29 @@ func (p *Plugin) handleRemoveAll(args *model.CommandArgs, force bool) (string, e
 		return fmt.Sprintf("Failed to persist config after bulk delete: %v", err), nil
 	}
 
+	// Refcount-aware webhook cleanup: only webhooks with zero remaining
+	// references get deleted. Shared group webhooks survive partial
+	// removes from other channels.
+	orphans := orphanedWebhookIDs(current, filtered)
+	webhookFailures := make([]string, 0)
+	for _, hookID := range orphans {
+		if err := p.deleteIncomingWebhook(args.UserId, hookID); err != nil {
+			p.API.LogWarn("remove-all: could not delete orphaned webhook (config entries pruned)",
+				"webhookID", hookID, "err", err.Error())
+			webhookFailures = append(webhookFailures, hookID)
+		}
+	}
+
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf(":wastebasket: Removed %d receiver(s) from this channel:\n\n", len(removed)))
 	for _, name := range removed {
 		b.WriteString(fmt.Sprintf("- `%s`\n", name))
 	}
+	if len(orphans) > 0 {
+		b.WriteString(fmt.Sprintf("\nDeleted %d Mattermost webhook(s) whose last receiver was just removed.\n", len(orphans)-len(webhookFailures)))
+	}
 	if len(webhookFailures) > 0 {
-		b.WriteString(fmt.Sprintf("\n:warning: Couldn't delete the underlying webhook for %d receiver(s) (config entries are gone, but the webhooks may linger in System Console → Integrations): `%s`\n",
+		b.WriteString(fmt.Sprintf("\n:warning: Couldn't delete %d underlying webhook(s) (config entries are gone, but webhook IDs may linger in System Console → Integrations): `%s`\n",
 			len(webhookFailures), strings.Join(webhookFailures, "`, `")))
 	}
 	b.WriteString("\nClean up the corresponding `slack_configs` blocks in `alertmanager.yml` and reload AM.")
@@ -217,16 +271,10 @@ func (p *Plugin) handleRemoveSet(args *model.CommandArgs, setName string, setSlu
 	current := p.getConfiguration().AlertConfigs
 	filtered := make([]alertConfig, 0, len(current))
 	removed := make([]string, 0, len(matched))
-	webhookFailures := make([]string, 0)
 	for _, c := range current {
 		if !namesToRemove[c.Name] {
 			filtered = append(filtered, c)
 			continue
-		}
-		if err := p.deleteIncomingWebhook(args.UserId, c.WebhookID); err != nil {
-			p.API.LogWarn("remove-set: could not delete incoming webhook (config entry still pruned)",
-				"receiver", c.Name, "webhookID", c.WebhookID, "err", err.Error())
-			webhookFailures = append(webhookFailures, c.Name)
 		}
 		removed = append(removed, c.Name)
 	}
@@ -235,13 +283,29 @@ func (p *Plugin) handleRemoveSet(args *model.CommandArgs, setName string, setSlu
 		return fmt.Sprintf("Failed to persist config after set delete: %v", err), nil
 	}
 
+	// Refcount-aware webhook cleanup: only fully-orphaned webhooks
+	// get deleted. A group webhook that still serves receivers in
+	// another channel (fan-out) survives.
+	orphans := orphanedWebhookIDs(current, filtered)
+	webhookFailures := make([]string, 0)
+	for _, hookID := range orphans {
+		if err := p.deleteIncomingWebhook(args.UserId, hookID); err != nil {
+			p.API.LogWarn("remove-set: could not delete orphaned webhook (config entries pruned)",
+				"webhookID", hookID, "err", err.Error())
+			webhookFailures = append(webhookFailures, hookID)
+		}
+	}
+
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf(":wastebasket: Removed %d `%s`-set receiver(s) from this channel:\n\n", len(removed), setName))
 	for _, name := range removed {
 		b.WriteString(fmt.Sprintf("- `%s`\n", name))
 	}
+	if len(orphans) > 0 {
+		b.WriteString(fmt.Sprintf("\nDeleted %d Mattermost webhook(s) whose last receiver was just removed.\n", len(orphans)-len(webhookFailures)))
+	}
 	if len(webhookFailures) > 0 {
-		b.WriteString(fmt.Sprintf("\n:warning: Couldn't delete the underlying webhook for %d receiver(s) (config entries are gone, webhooks may linger in System Console → Integrations): `%s`\n",
+		b.WriteString(fmt.Sprintf("\n:warning: Couldn't delete %d underlying webhook(s) (config entries gone; webhook IDs may linger in System Console → Integrations): `%s`\n",
 			len(webhookFailures), strings.Join(webhookFailures, "`, `")))
 	}
 	b.WriteString("\nRemove the matching `slack_configs` and `routes:` entries from your `alertmanager.yml` and reload AM.")
@@ -281,52 +345,131 @@ func (p *Plugin) handleRotate(args *model.CommandArgs) (string, error) {
 	return p.handleRotateSingle(args, target)
 }
 
-// handleRotateSingle rotates one receiver by name (or short-name).
-// Stamps LastRotatedAt on success.
+// handleRotateSingle rotates the underlying Mattermost webhook for one
+// receiver (or, in the group-webhook case, every receiver sharing that
+// webhook). Stamps LastRotatedAt + clears LastReminderAt on every
+// affected entry.
+//
+// Group-webhook behavior (v1.0.3+): rotating a grouped receiver rotates
+// the SHARED webhook. Every receiver in that group gets the new URL —
+// alertmanager.yml must be updated for all of them, not just the one
+// the operator named. The response message lists the full affected set
+// and (for groups) DMs the merged YAML bundle.
 func (p *Plugin) handleRotateSingle(args *model.CommandArgs, name string) (string, error) {
 	current := p.getConfiguration().AlertConfigs
 	resolved := resolveReceiverName(current, name, args.ChannelId, p)
-	idx := -1
+	targetIdx := -1
 	for i, c := range current {
 		if c.Name == resolved {
-			idx = i
+			targetIdx = i
 			break
 		}
 	}
-	if idx == -1 {
+	if targetIdx == -1 {
 		return fmt.Sprintf("Receiver %q not found.", name), nil
 	}
 
-	oldEntry := current[idx]
-	channelID, err := p.resolveOrCreateChannel(oldEntry.Team, oldEntry.Channel)
+	target := current[targetIdx]
+	oldHookID := target.WebhookID
+
+	// Find every receiver sharing this webhookID. For legacy receivers
+	// (empty GroupName, individual webhook) this is just the named one.
+	// For grouped receivers it's the whole group, including any in other
+	// channels — though with the current group-create logic, all members
+	// share team+channel so cross-channel sharing shouldn't arise. Still,
+	// the parser tolerates it via the same-team+channel+group invariant,
+	// so the rotation handler tolerates it too.
+	affectedIdx := make([]int, 0)
+	for i, c := range current {
+		if c.WebhookID == oldHookID {
+			affectedIdx = append(affectedIdx, i)
+		}
+	}
+
+	channelID, err := p.resolveOrCreateChannel(target.Team, target.Channel)
 	if err != nil {
 		return fmt.Sprintf("Failed to resolve destination channel for rotation: %v", err), nil
 	}
 
-	newHookID, err := p.createIncomingWebhook(args.UserId, channelID, fmt.Sprintf("Alertmanager: %s", name))
+	// Webhook display name for the replacement follows the same rule as
+	// /alertmanager add: <group-or-slug>--<channel>. Legacy receivers
+	// (empty GroupName) keep the per-receiver naming form so the System
+	// Console webhook list stays self-explanatory for those entries.
+	var newDisplayName string
+	if target.GroupName != "" {
+		newDisplayName = fmt.Sprintf("Alertmanager: %s--%s", target.GroupName, target.Channel)
+	} else {
+		newDisplayName = fmt.Sprintf("Alertmanager: %s", target.Name)
+	}
+	newHookID, err := p.createIncomingWebhook(args.UserId, channelID, newDisplayName)
 	if err != nil {
 		return fmt.Sprintf("Failed to create replacement webhook: %v", err), nil
 	}
 
-	if err := p.deleteIncomingWebhook(args.UserId, oldEntry.WebhookID); err != nil {
-		p.API.LogWarn("could not delete old webhook during rotation (continuing)", "oldWebhookID", oldEntry.WebhookID, "err", err.Error())
+	if err := p.deleteIncomingWebhook(args.UserId, oldHookID); err != nil {
+		p.API.LogWarn("could not delete old webhook during rotation (continuing)", "oldWebhookID", oldHookID, "err", err.Error())
 	}
 
 	updated := make([]alertConfig, len(current))
 	copy(updated, current)
-	updated[idx].WebhookID = newHookID
-	// Stamp LastRotatedAt and clear LastReminderAt — the reminder
-	// scheduler treats this as a fresh start for the receiver.
-	updated[idx].LastRotatedAt = time.Now().UTC()
-	updated[idx].LastReminderAt = time.Time{}
+	now := time.Now().UTC()
+	for _, idx := range affectedIdx {
+		updated[idx].WebhookID = newHookID
+		updated[idx].LastRotatedAt = now
+		updated[idx].LastReminderAt = time.Time{}
+	}
 
 	if err := p.saveConfigs(updated); err != nil {
 		_ = p.deleteIncomingWebhook(args.UserId, newHookID)
 		return fmt.Sprintf("Failed to persist rotated config (new webhook rolled back): %v", err), nil
 	}
 
-	p.auditLog("webhook.rotation.executed", args.UserId, updated[idx].Name, args.ChannelId, "single")
-	return p.renderRotateResponse(updated[idx]), nil
+	p.auditLog("webhook.rotation.executed", args.UserId, target.Name, args.ChannelId,
+		fmt.Sprintf("affected=%d group=%q", len(affectedIdx), target.GroupName))
+
+	// Single-receiver case (legacy or true individual): inline YAML,
+	// matches v1.0.2 behavior.
+	if len(affectedIdx) == 1 {
+		ac := updated[affectedIdx[0]]
+		return p.renderRotateResponse(ac), nil
+	}
+
+	// Group case: list affected receivers, DM the merged YAML bundle.
+	affected := make([]alertConfig, 0, len(affectedIdx))
+	for _, idx := range affectedIdx {
+		affected = append(affected, updated[idx])
+	}
+	return p.renderRotateGroupResponse(args.UserId, affected, target.GroupName), nil
+}
+
+// renderRotateGroupResponse builds the in-channel summary AND fires the
+// DM with the merged YAML bundle when the rotated webhook serves a
+// multi-receiver group. Same DM shape as /alertmanager rotate all
+// --overdue — operator pastes once into alertmanager.yml.
+func (p *Plugin) renderRotateGroupResponse(userID string, affected []alertConfig, groupName string) string {
+	primary := affected[0]
+	var y strings.Builder
+	y.WriteString(fmt.Sprintf("# Alertmanager receivers re-rotated by /alertmanager rotate (group %q)\n", groupName))
+	y.WriteString(fmt.Sprintf("# %d receiver(s) share the rotated webhook.\n", len(affected)))
+	y.WriteString("# Paste under `receivers:` in your alertmanager.yml, then reload AM.\n")
+	y.WriteString("# Old URLs deactivated immediately — alert delivery resumes after the AM reload.\n\n")
+	for _, ac := range affected {
+		y.WriteString(renderReceiverYAML(ac.Name, p.webhookURLForReceiver(ac), ac.Channel, p.runbookDefaultURL(receiverBaseSlug(ac.Name)), p.siteURL()+webhookIconURL))
+		y.WriteString("\n")
+	}
+	routesYAML := assembleRoutesYAML(affected)
+	if dmErr := p.dmYAMLBundle(userID, y.String(), routesYAML, len(affected), primary.AlertManagerURL); dmErr != nil {
+		p.API.LogWarn("rotation: couldn't DM YAML after group rotate", "err", dmErr.Error())
+	}
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf(":key: Rotated `%s` group webhook in `~%s`. **The old URL no longer works for any of the %d affected receiver(s).**\n\n", groupName, primary.Channel, len(affected)))
+	b.WriteString("**Affected:**\n")
+	for _, ac := range affected {
+		b.WriteString("- `" + ac.Name + "`\n")
+	}
+	b.WriteString(fmt.Sprintf("\nMerged YAML DM'd to you from `@%s`. Paste it into your `alertmanager.yml`, then reload AM (`curl -X POST %s/-/reload`).", webhookUsername, primary.AlertManagerURL))
+	return b.String()
 }
 
 // handleRotateOverdue rotates every receiver bound to the calling

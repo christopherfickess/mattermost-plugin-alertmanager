@@ -7,6 +7,14 @@ Mattermost deployment.
 Run this before every release that touches `server/reconciler.go`,
 `server/yaml_janitor.go`, or anything in the cluster-leader path.
 
+The reconciler cycle handles three things in one leader-elected
+goroutine: orphan pruning, the YAML auto-delete janitor, and (when
+`WebhookRotationDays > 0`) the rotation reminder pass. All three
+need single-leader semantics — duplicate execution either spams
+admins or races on `saveConfigs`. The procedure below covers all
+three implicitly: anything that breaks the leader election breaks
+all three.
+
 ## Why this needs verification
 
 The reconciler is the only piece of the plugin that's

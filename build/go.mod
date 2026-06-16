@@ -1,4 +1,4 @@
-module github.com/christopherfickess/mattermost-plugin-alertmanager/build
+module github.com/mattermost/mattermost-plugin-alertmanager/build
 
 go 1.26.3
 

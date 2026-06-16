@@ -9,7 +9,7 @@ import (
 
 	"github.com/mattermost/mattermost/server/public/model"
 
-	root "github.com/christopherfickess/mattermost-plugin-alertmanager"
+	root "github.com/mattermost/mattermost-plugin-alertmanager"
 )
 
 // scaffoldSet maps a set name to the slugs it includes. `all` covers
@@ -53,22 +53,30 @@ var scaffoldSets = map[string][]string{
 	},
 }
 
-// handleAdd creates one Mattermost incoming webhook per runbook in the
-// chosen set, all bound to the same channel. The only creation path —
-// custom one-off receivers aren't supported because every receiver
-// corresponds to a runbook (a documented failure mode). New failure
-// modes are expressed as new runbook .md files contributed upstream.
+// handleAdd creates Mattermost incoming webhooks for the chosen target
+// (group or individual runbook), all bound to the same channel.
 //
-// Idempotent — existing receivers (by name) are skipped, not
-// overwritten. Failures on individual entries don't abort the batch.
+// Webhook consolidation (v1.0.3+): receivers created in one add invocation
+// share a single Mattermost webhook. A group target (compute, all, etc.)
+// produces N receivers all pointing at one webhook; an individual slug
+// target produces one receiver with its own webhook. The shared-webhook
+// name follows <group-or-slug>--<channel> form.
+//
+// Idempotent — existing receivers (by name) are skipped, not overwritten.
+// When ALL targets in the group already exist, no new webhook is created.
 //
 // Usage:
 //
-//	/alertmanager add <team> <channel> <am-url> [set]
+//	/alertmanager add <team> <channel> <am-url> [target] [on] [--webhook-host=<url>]
 //
-// `set` defaults to `standard` (= all 20 embedded runbooks). Category
-// names (compute, application, database, storage, networking,
-// observability) create just that subset.
+// `target` is one of:
+//   - A category set keyword: `all` (default), `compute`, `application`,
+//     `database`, `storage`, `networking`, `observability`
+//   - An individual runbook slug: `high-cpu-usage`, `database-replication-lag`, etc.
+//
+// Trailing `on` opts the receivers in to rotation reminders. Optional
+// `--webhook-host=<url>` overrides the host portion of the rendered
+// api_url for the multi-cluster deployment pattern.
 func (p *Plugin) handleAdd(args *model.CommandArgs) (string, error) {
 	if err := p.requireChannelTeamAdmin(args.UserId, args.ChannelId); err != nil {
 		return err.Error(), nil
@@ -79,8 +87,8 @@ func (p *Plugin) handleAdd(args *model.CommandArgs) (string, error) {
 
 	// Extract --webhook-host=<url> from anywhere in the args list.
 	// Remaining args are positional. Allows usage like:
-	//   /alertmanager add <team> <channel> <am-url> [set] [--webhook-host=<url>]
-	//   /alertmanager add --webhook-host=<url> <team> <channel> <am-url> [set]
+	//   /alertmanager add <team> <channel> <am-url> [target] [--webhook-host=<url>]
+	//   /alertmanager add --webhook-host=<url> <team> <channel> <am-url> [target]
 	webhookHostOverride, rest := extractFlagValue(rest, "--webhook-host=")
 	if webhookHostOverride != "" {
 		if err := validateWebhookHost(webhookHostOverride); err != nil {
@@ -110,17 +118,17 @@ func (p *Plugin) handleAdd(args *model.CommandArgs) (string, error) {
 	}
 
 	team, channel, amURL := rest[0], rest[1], strings.TrimRight(rest[2], "/")
-	setName := "all"
+	target := "all"
 	if len(rest) == 4 {
-		setName = strings.ToLower(rest[3])
+		target = strings.ToLower(rest[3])
 	}
 
-	slugs, err := resolveScaffoldSet(setName)
+	groupName, slugs, err := resolveAddTarget(target)
 	if err != nil {
 		return err.Error(), nil
 	}
 	if len(slugs) == 0 {
-		return ":warning: Set `" + setName + "` resolved to zero runbooks. Either the embedded runbook list is empty or the category map is misconfigured.", nil
+		return ":warning: Target `" + target + "` resolved to zero runbooks. Either the embedded runbook list is empty or the category map is misconfigured.", nil
 	}
 
 	// Resolve the destination channel ONCE rather than per-receiver. All
@@ -130,15 +138,10 @@ func (p *Plugin) handleAdd(args *model.CommandArgs) (string, error) {
 		return fmt.Sprintf("Failed to resolve destination channel: %v", err), nil
 	}
 
-	// Iterate and create. Per-entry results captured in a table so the
-	// user can see what happened in one glance — created, skipped, or
-	// failed.
-	//
 	// Skip-check is scoped to the destination channel only. A receiver
-	// named `high-cpu-usage` bound to ~alert-slo-channel must NOT block
-	// creating `high-cpu-usage--alert-sre-channel` in ~alert-sre-channel
-	// — that's the fan-out use case. The new suffixed name is unique
-	// globally by construction, so per-channel scoping is sufficient.
+	// named `high-cpu-usage--alert-slo-channel` MUST block creating it
+	// again, but `high-cpu-usage--alert-sre-channel` in another channel
+	// is independent (fan-out pattern). Walk current config once.
 	current := p.getConfiguration().AlertConfigs
 	existingInThisChannel := make(map[string]bool)
 	for _, c := range current {
@@ -147,57 +150,68 @@ func (p *Plugin) handleAdd(args *model.CommandArgs) (string, error) {
 		}
 	}
 
+	// Two-pass: identify slugs that need creation, then create one shared
+	// webhook for the whole batch. Channel-suffix every receiver name
+	// (pattern <slug>--<channel>); the shared webhook itself is named
+	// <group-or-slug>--<channel> in Mattermost.
 	results := make([]scaffoldResult, 0, len(slugs))
-	newEntries := make([]alertConfig, 0, len(slugs))
-
-	// Channel-suffix every receiver name. Pattern is <slug>--<channel>.
-	// Guarantees uniqueness across channels — the same runbook (e.g.
-	// high-cpu-usage) can be subscribed by multiple channels for
-	// fan-out without collisions in the AM receiver namespace. The
-	// short slug (high-cpu-usage) is still discoverable as the runbook
-	// identifier; the suffix is what makes the AM `receiver:` field
-	// unique.
+	newSlugs := make([]string, 0, len(slugs))
 	for _, slug := range slugs {
 		receiverName := receiverNameForChannel(slug, channel)
-
-		// Skip if either the suffixed name OR the unsuffixed legacy
-		// name exists IN THIS CHANNEL. Legacy entries in OTHER channels
-		// don't block — they're independent bindings (fan-out pattern).
 		if existingInThisChannel[receiverName] || existingInThisChannel[slug] {
 			results = append(results, scaffoldResult{receiverName, "skipped", "already exists"})
 			continue
 		}
-
-		hookID, err := p.createIncomingWebhook(args.UserId, channelID, fmt.Sprintf("Alertmanager: %s", receiverName))
-		if err != nil {
-			results = append(results, scaffoldResult{receiverName, "failed", err.Error()})
-			continue
-		}
-
-		newEntries = append(newEntries, alertConfig{
-			Name:                     receiverName,
-			Team:                     team,
-			Channel:                  channel,
-			AlertManagerURL:          amURL,
-			WebhookID:                hookID,
-			WebhookHostOverride:      webhookHostOverride,
-			LastRotatedAt:            time.Now().UTC(),
-			RotationRemindersEnabled: rotationOptIn,
-		})
-		results = append(results, scaffoldResult{receiverName, "created", hookID})
+		newSlugs = append(newSlugs, slug)
 	}
 
-	// Persist all new entries in one save rather than 20 individual saves.
+	newEntries := make([]alertConfig, 0, len(newSlugs))
+	var sharedHookID string
+
+	if len(newSlugs) > 0 {
+		// One Mattermost webhook serves every receiver in this add
+		// invocation. Display name follows <group-or-slug>--<channel>
+		// so System Console → Integrations → Incoming Webhooks shows
+		// the unit, not the per-receiver slug.
+		webhookDisplayName := fmt.Sprintf("Alertmanager: %s--%s", groupName, channel)
+		hookID, hookErr := p.createIncomingWebhook(args.UserId, channelID, webhookDisplayName)
+		if hookErr != nil {
+			// Webhook creation failed — every requested new slug fails.
+			// Existing skipped slugs remain in the results; rendering
+			// below shows the full picture.
+			for _, slug := range newSlugs {
+				results = append(results, scaffoldResult{receiverNameForChannel(slug, channel), "failed", hookErr.Error()})
+			}
+		} else {
+			sharedHookID = hookID
+			now := time.Now().UTC()
+			for _, slug := range newSlugs {
+				receiverName := receiverNameForChannel(slug, channel)
+				newEntries = append(newEntries, alertConfig{
+					Name:                     receiverName,
+					Team:                     team,
+					Channel:                  channel,
+					AlertManagerURL:          amURL,
+					WebhookID:                sharedHookID,
+					GroupName:                groupName,
+					WebhookHostOverride:      webhookHostOverride,
+					LastRotatedAt:            now,
+					RotationRemindersEnabled: rotationOptIn,
+				})
+				results = append(results, scaffoldResult{receiverName, "created", sharedHookID})
+			}
+		}
+	}
+
+	// Persist all new entries in one save rather than N individual saves.
 	// Single SavePluginConfig call = no race risk between OnConfigurationChange
 	// firings = atomic-to-plugin-settings semantics. If the save fails, we
-	// roll back the created webhooks so the user isn't left with orphans.
+	// roll back the shared webhook so the user isn't left with an orphan.
 	if len(newEntries) > 0 {
 		merged := append(p.getConfiguration().AlertConfigs, newEntries...)
 		if err := p.saveConfigs(merged); err != nil {
-			for _, e := range newEntries {
-				_ = p.deleteIncomingWebhook(args.UserId, e.WebhookID)
-			}
-			return fmt.Sprintf("Failed to persist scaffold (rolled back %d webhook creations): %v", len(newEntries), err), nil
+			_ = p.deleteIncomingWebhook(args.UserId, sharedHookID)
+			return fmt.Sprintf("Failed to persist scaffold (rolled back shared webhook): %v", err), nil
 		}
 	}
 
@@ -480,23 +494,35 @@ type scaffoldResult struct {
 	Detail string
 }
 
-// resolveScaffoldSet returns the slug list for a named set. `all`
-// resolves to the full embedded runbook list at runtime (whatever
-// runbooks/*.md is bundled into the plugin). Category names resolve to
-// the hardcoded subset in scaffoldSets. Unknown names get a friendly
-// error listing what's available.
-func resolveScaffoldSet(name string) ([]string, error) {
-	name = strings.ToLower(strings.TrimSpace(name))
+// resolveAddTarget classifies the [target] arg of /alertmanager add as
+// either a group set keyword or an individual runbook slug. Returns
+// (groupName, slugs) where groupName is the unit name baked into the
+// shared webhook's display name + each receiver's GroupName field, and
+// slugs is the runbooks to create receivers for (whole set for groups,
+// single-element for individual).
+//
+// "all" resolves to every embedded runbook (groupName = "all").
+// Category names (compute, application, ...) resolve to their subset.
+// Otherwise we check if the arg matches a known runbook slug — if so,
+// it's an individual add and groupName = the slug itself.
+// Anything else is an error with a discoverability hint.
+func resolveAddTarget(target string) (groupName string, slugs []string, err error) {
+	target = strings.ToLower(strings.TrimSpace(target))
 
-	if name == "all" {
-		return runbookSlugs(), nil
+	if target == "all" {
+		return "all", runbookSlugs(), nil
 	}
-
-	slugs, ok := scaffoldSets[name]
-	if !ok {
-		return nil, fmt.Errorf("unknown set `%s`. Available sets: %s", name, strings.Join(scaffoldSetNames(), ", "))
+	if setSlugs, ok := scaffoldSets[target]; ok && setSlugs != nil {
+		return target, setSlugs, nil
 	}
-	return slugs, nil
+	// Individual add path: must match a known runbook slug exactly.
+	for _, s := range runbookSlugs() {
+		if s == target {
+			return target, []string{target}, nil
+		}
+	}
+	return "", nil, fmt.Errorf("unknown target `%s` — must be a category set (`%s`) OR a specific runbook slug (e.g. `high-cpu-usage`). Run `/alertmanager add` with no args for the full list",
+		target, strings.Join(scaffoldSetNames(), "`, `"))
 }
 
 // scaffoldSetNames returns the sorted list of known set names for help
@@ -515,15 +541,18 @@ func scaffoldSetNames() []string {
 }
 
 // addUsageMessage renders the help shown when the user runs
-// /alertmanager add with wrong arity. Lists every available set and
-// what it includes — discoverability matters because this is the
-// bootstrap step and the user shouldn't have to read source to use it.
+// /alertmanager add with wrong arity. Lists every available set,
+// the individual-slug path, and the optional flags. Discoverability
+// matters because this is the bootstrap step and the user shouldn't
+// have to read source to use it.
 func addUsageMessage() string {
 	var b strings.Builder
-	b.WriteString("**Usage:** `/alertmanager add <team> <channel> <am-url> [set]`\n\n")
-	b.WriteString("Creates one Mattermost incoming webhook per runbook in the chosen set, all bound to the named channel.\n")
+	b.WriteString("**Usage:** `/alertmanager add <team> <channel> <am-url> [target] [on] [--webhook-host=<url>]`\n\n")
+	b.WriteString("Creates Mattermost incoming webhook(s) for the chosen target, all bound to the named channel.\n")
+	b.WriteString("- **Group target** (e.g. `compute`, `all`): one shared webhook serves every receiver in the set.\n")
+	b.WriteString("- **Individual slug target** (e.g. `high-cpu-usage`): one dedicated webhook for that one receiver.\n")
 	b.WriteString("Existing receivers (by name) are skipped — re-run safely.\n\n")
-	b.WriteString("**Available sets:**\n\n")
+	b.WriteString("**Group targets:**\n\n")
 	b.WriteString("| Set | Count | Includes |\n")
 	b.WriteString("|-----|-------|----------|\n")
 
@@ -537,6 +566,11 @@ func addUsageMessage() string {
 		slugs := scaffoldSets[name]
 		b.WriteString(fmt.Sprintf("| `%s` | %d | %s |\n", name, len(slugs), strings.Join(slugs, ", ")))
 	}
+
+	b.WriteString("\n**Individual slug targets:** any runbook slug. Run `/alertmanager docs` to see what ships.\n\n")
+	b.WriteString("**Optional args:**\n")
+	b.WriteString("- `on` — opt these receivers in to webhook rotation reminders (see `WebhookRotationDays` in System Console)\n")
+	b.WriteString("- `--webhook-host=<url>` — override the host portion of the rendered `api_url` for the multi-cluster pattern\n")
 	return b.String()
 }
 

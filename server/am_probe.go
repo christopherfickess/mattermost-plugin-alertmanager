@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/christopherfickess/mattermost-plugin-alertmanager/server/alertmanager"
+	"github.com/mattermost/mattermost-plugin-alertmanager/server/alertmanager"
 )
 
 // amReachabilityTTL is how long a reachability probe result is cached

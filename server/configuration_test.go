@@ -183,17 +183,72 @@ func TestParseAlertConfigs(t *testing.T) {
 		}
 	})
 
-	t.Run("duplicate webhookID is rejected", func(t *testing.T) {
+	t.Run("shared webhookID with matching team+channel+group is allowed", func(t *testing.T) {
+		// v1.0.3+ group webhooks: N receivers in the same group share
+		// one webhookID. Validates that the constraint relaxation works.
 		blob := `[
-			{"name":"x","team":"ops","channel":"alerts","webhookID":"w1"},
-			{"name":"y","team":"ops","channel":"alerts","webhookID":"w1"}
+			{"name":"high-cpu-usage--alerts","team":"ops","channel":"alerts","webhookID":"w1","groupName":"compute"},
+			{"name":"high-memory-usage--alerts","team":"ops","channel":"alerts","webhookID":"w1","groupName":"compute"}
+		]`
+		entries, err := parseAlertConfigs(blob)
+		if err != nil {
+			t.Fatalf("expected no error for shared webhookID within group, got %v", err)
+		}
+		if len(entries) != 2 {
+			t.Fatalf("expected 2 entries, got %d", len(entries))
+		}
+		if entries[0].WebhookID != entries[1].WebhookID {
+			t.Fatalf("webhookID should be shared; got %q vs %q", entries[0].WebhookID, entries[1].WebhookID)
+		}
+	})
+
+	t.Run("shared webhookID across mismatched groups is rejected", func(t *testing.T) {
+		// Catches the bad-state cases: hand-edit error or plugin bug
+		// where one webhookID gets claimed by two different groups.
+		blob := `[
+			{"name":"x--alerts","team":"ops","channel":"alerts","webhookID":"w1","groupName":"compute"},
+			{"name":"y--alerts","team":"ops","channel":"alerts","webhookID":"w1","groupName":"database"}
 		]`
 		_, err := parseAlertConfigs(blob)
 		if err == nil {
-			t.Fatal("expected duplicate-webhookID error")
+			t.Fatal("expected error for mismatched groups sharing webhookID")
 		}
 		if !strings.Contains(err.Error(), "webhookID") {
 			t.Fatalf("expected webhookID error, got %q", err.Error())
+		}
+	})
+
+	t.Run("shared webhookID across mismatched channels is rejected", func(t *testing.T) {
+		blob := `[
+			{"name":"x--alerts","team":"ops","channel":"alerts","webhookID":"w1","groupName":"compute"},
+			{"name":"y--oncall","team":"ops","channel":"oncall","webhookID":"w1","groupName":"compute"}
+		]`
+		_, err := parseAlertConfigs(blob)
+		if err == nil {
+			t.Fatal("expected error for mismatched channels sharing webhookID")
+		}
+	})
+
+	t.Run("legacy empty groupName still gets per-receiver webhook validation", func(t *testing.T) {
+		// Pre-v1.0.3 receivers have empty groupName. Two of them with
+		// matching empty group + same team+channel CAN share a webhookID
+		// under the new rules (since all fields match), but a legacy
+		// install would never produce that state — every old receiver
+		// got its own webhook. Just confirms the validation doesn't
+		// barf on legacy shape.
+		blob := `[
+			{"name":"a--alerts","team":"ops","channel":"alerts","webhookID":"w1"},
+			{"name":"b--alerts","team":"ops","channel":"alerts","webhookID":"w2"}
+		]`
+		entries, err := parseAlertConfigs(blob)
+		if err != nil {
+			t.Fatalf("legacy shape should still validate, got %v", err)
+		}
+		if len(entries) != 2 {
+			t.Fatalf("expected 2 entries, got %d", len(entries))
+		}
+		if entries[0].GroupName != "" || entries[1].GroupName != "" {
+			t.Fatalf("expected empty GroupName for legacy entries")
 		}
 	})
 

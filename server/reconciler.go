@@ -289,19 +289,40 @@ func (p *Plugin) reconcileOrphans(actingUserID string) ([]string, error) {
 	}
 	defer cleanup()
 
-	orphanSet := make(map[string]bool)
+	// Probe each UNIQUE WebhookID once — group webhooks (v1.0.3+) share
+	// one hookID across N receivers, so per-receiver probing would
+	// multiply the API call rate. The cache maps hookID to "exists" so
+	// the prune pass below can mark every receiver in a dead group as
+	// orphaned without re-querying.
+	hookStatus := make(map[string]bool)
 	for _, ac := range current {
+		if _, seen := hookStatus[ac.WebhookID]; seen {
+			continue
+		}
 		_, resp, err := c.GetIncomingWebhook(context.Background(), ac.WebhookID, "")
 		if err == nil {
+			hookStatus[ac.WebhookID] = true
 			continue
 		}
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
-			orphanSet[ac.Name] = true
+			hookStatus[ac.WebhookID] = false
 			continue
 		}
-		// Transient or permission error — don't prune. Log and move on.
+		// Transient or permission error — don't cache this hookID's
+		// status. Receivers depending on it stay alive this cycle.
 		p.API.LogWarn("reconciler: error checking webhook (will retry next cycle)",
 			"receiver", ac.Name, "webhookID", ac.WebhookID, "err", err.Error())
+	}
+
+	// Mark every receiver whose shared webhookID came back 404. Cached
+	// status lookups: a single dead webhook in a 6-receiver group
+	// orphans all 6 here.
+	orphanSet := make(map[string]bool)
+	for _, ac := range current {
+		alive, known := hookStatus[ac.WebhookID]
+		if known && !alive {
+			orphanSet[ac.Name] = true
+		}
 	}
 
 	if len(orphanSet) == 0 {

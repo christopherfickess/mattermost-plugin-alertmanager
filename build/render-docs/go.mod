@@ -1,4 +1,4 @@
-module github.com/christopherfickess/mattermost-plugin-alertmanager/build/render-docs
+module github.com/mattermost/mattermost-plugin-alertmanager/build/render-docs
 
 go 1.26.1
 

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/christopherfickess/mattermost-plugin-alertmanager/server/alertmanager"
+	"github.com/mattermost/mattermost-plugin-alertmanager/server/alertmanager"
 )
 
 // outboundHTTPTimeout caps how long any single Alertmanager API call

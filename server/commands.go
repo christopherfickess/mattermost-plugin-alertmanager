@@ -15,7 +15,7 @@ const (
 	helpMsg = "**Alertmanager bridge slash commands** _(channel-scoped — you only see receivers bound to this channel)_\n\n" +
 		"_All commands listed in alphabetical order to match the autocomplete dropdown._\n\n" +
 		"- `/alertmanager about` — plugin build info, configured settings, reconciler health, jump-off links\n" +
-		"- `/alertmanager add <team> <channel> <am-url> [set] [on]` — bulk-create receivers for a named set: `all` (default, every runbook), `application`, `compute`, `database`, `networking`, `observability`, `storage`. Trailing `on` opts these receivers INTO rotation reminders (configured via System Console → WebhookRotationDays).\n" +
+		"- `/alertmanager add <team> <channel> <am-url> [target] [on]` — create receivers for a group set OR an individual runbook slug. Group sets: `all` (default), `application`, `compute`, `database`, `networking`, `observability`, `storage`. Each group share ONE Mattermost webhook; individual-slug adds get their own webhook. Trailing `on` opts these receivers INTO rotation reminders (configured via System Console → WebhookRotationDays).\n" +
 		"- `/alertmanager alerts` — list currently firing alerts (grouped by Alertmanager URL — one section per backend, not per receiver)\n" +
 		"- `/alertmanager config <name>` — show full detail card + slack_configs YAML for one receiver\n" +
 		"- `/alertmanager docs [topic]` — embedded documentation (tab through topics: architecture, configuration, development, kubernetes, slash_commands)\n" +
@@ -28,7 +28,7 @@ const (
 		"- `/alertmanager rotate <name>` — delete + recreate the webhook (new hook-id, new URL)\n" +
 		"- `/alertmanager silences` — list active silences (grouped by Alertmanager URL)\n" +
 		"- `/alertmanager status` — Alertmanager version + uptime per backend (grouped by Alertmanager URL)\n" +
-		"- `/alertmanager validate [name|set] [--webhook-test|--end-to-end|--simulate <labels>]` — validate pipeline configuration. Without flags: AM reach + receiver-loaded-in-AM. `--webhook-test` / `--end-to-end` fire side-effect tests. `--simulate runbook=<slug> severity=<level>` walks AM's loaded route tree against the labels and reports which receiver(s) an alert with those labels would dispatch to (read-only, no synthetic alert)."
+		"- `/alertmanager validate [name|set] [--webhook-test|--end-to-end|--simulate <labels>] [--severity=<value>]` — validate pipeline configuration. Without flags: AM reach + receiver-loaded-in-AM. `--webhook-test` / `--end-to-end` fire side-effect tests. `--simulate runbook=<slug> severity=<level>` walks AM's loaded route tree against the labels and reports which receiver(s) an alert with those labels would dispatch to (read-only, no synthetic alert). `--severity=<warning|critical|info|all>` controls which severities `--end-to-end` fires; `all` fires four alerts per receiver (warning + critical + info + resolved) so you can visually verify every render path in one shot."
 )
 
 // getCommand returns the model.Command registration. Autocomplete data
@@ -71,18 +71,18 @@ func getAutocompleteData() *model.AutocompleteData {
 
 	root.AddCommand(model.NewAutocompleteData("about", "", "Plugin build info, configured settings, and links"))
 
-	add := model.NewAutocompleteData("add", "[team] [channel] [am-url] [set] [on]", "Create receivers for a named runbook set. Trailing `on` opts in to rotation reminders. (sysadmin/team_admin)")
+	add := model.NewAutocompleteData("add", "[team] [channel] [am-url] [target] [on]", "Create receivers for a group set OR individual runbook slug. One shared webhook per group; individual slugs get their own. Trailing `on` opts in to rotation reminders. (sysadmin/team_admin)")
 	add.AddDynamicListArgument("Mattermost team URL slug — tab through your teams", teamFetchURL, true)
 	add.AddDynamicListArgument("Mattermost channel URL slug — public channels in the chosen team (or type a new name to auto-create)", channelFetchURL, true)
 	add.AddTextArgument("Alertmanager API base URL (no trailing slash)", "[am-url]", "")
-	add.AddStaticListArgument("Set of runbooks to create (defaults to `all` = every embedded runbook)", false, []model.AutocompleteListItem{
-		{Item: "all", HelpText: "Every embedded runbook (default — 20 receivers)"},
-		{Item: "application", HelpText: "HTTP error, latency, endpoint, request-rate alerts (4)"},
-		{Item: "compute", HelpText: "CPU, memory, pod, deployment, node alerts (6)"},
-		{Item: "database", HelpText: "Connectivity, replication lag, query latency (3)"},
-		{Item: "networking", HelpText: "Ingress 5xx, cert expiry, DNS failure (3)"},
-		{Item: "observability", HelpText: "Prometheus scrape down, Alertmanager notify fail (2)"},
-		{Item: "storage", HelpText: "PV full, disk fill rate (2)"},
+	add.AddStaticListArgument("Group set OR individual runbook slug (defaults to `all`). Type a slug freely; static list shows group sets only.", false, []model.AutocompleteListItem{
+		{Item: "all", HelpText: "Every embedded runbook (default — 20 receivers in one shared webhook)"},
+		{Item: "application", HelpText: "HTTP error, latency, endpoint, request-rate alerts (4) — one shared webhook"},
+		{Item: "compute", HelpText: "CPU, memory, pod, deployment, node alerts (6) — one shared webhook"},
+		{Item: "database", HelpText: "Connectivity, replication lag, query latency (3) — one shared webhook"},
+		{Item: "networking", HelpText: "Ingress 5xx, cert expiry, DNS failure (3) — one shared webhook"},
+		{Item: "observability", HelpText: "Prometheus scrape down, Alertmanager notify fail (2) — one shared webhook"},
+		{Item: "storage", HelpText: "PV full, disk fill rate (2) — one shared webhook"},
 	})
 	add.AddStaticListArgument("Optional: enable webhook rotation reminders for these receivers", false, []model.AutocompleteListItem{
 		{Item: "on", HelpText: "Opt receivers in this channel INTO rotation reminders. Sysadmins get DM'd when these webhooks haven't been rotated for the threshold set in System Console → WebhookRotationDays. Without this flag, these receivers are never reminded — even if the global threshold is set. Per-channel scope: opting in here does not affect receivers in other channels."},
@@ -101,6 +101,7 @@ func getAutocompleteData() *model.AutocompleteData {
 		{Item: "configuration", HelpText: "Plugin settings + alertmanager.yml structure"},
 		{Item: "development", HelpText: "Local build, test, deploy workflow"},
 		{Item: "kubernetes", HelpText: "K8s deployment notes (WebhookHost, HA reconciler, NetworkPolicy)"},
+		{Item: "rotation", HelpText: "Webhook rotation reminder playbook (WebhookRotationDays, `on` opt-in, `rotate all --overdue`)"},
 		{Item: "slash_commands", HelpText: "Full reference of all /alertmanager subcommands"},
 	})
 	root.AddCommand(docs)
@@ -159,10 +160,21 @@ func getAutocompleteData() *model.AutocompleteData {
 		{Item: "observability", HelpText: "Observability receivers only"},
 		{Item: "storage", HelpText: "Storage receivers only"},
 	})
-	validate.AddStaticListArgument("Optional flag — pick a side-effect test or simulate route resolution", false, []model.AutocompleteListItem{
+	validate.AddStaticListArgument("Optional mode flag — pick how validate runs", false, []model.AutocompleteListItem{
 		{Item: "--webhook-test", HelpText: "Also POST a visible test message to each receiver's webhook"},
-		{Item: "--end-to-end", HelpText: "Also fire a synthetic alert through Alertmanager; watch the channel for delivery"},
+		{Item: "--end-to-end", HelpText: "Also fire a synthetic alert through Alertmanager; watch the channel for delivery (default severity=warning)"},
 		{Item: "--simulate", HelpText: "Walk AM's loaded route tree against a label set you supply. Type `key=value` pairs after the flag (e.g., `--simulate runbook=high-cpu-usage severity=critical`). Read-only — no synthetic alert is fired, safe to run repeatedly."},
+	})
+	// Severity is a modifier for --end-to-end. Mattermost autocomplete
+	// is positional, so this gets its own position immediately after
+	// the mode flag — typing `--end-to-end<space>` brings up this
+	// dropdown next, making the values discoverable without leaving
+	// chat.
+	validate.AddStaticListArgument("Optional severity for --end-to-end (no effect on other modes)", false, []model.AutocompleteListItem{
+		{Item: "--severity=warning", HelpText: "Fire --end-to-end synthetic at warning severity (yellow sidebar). This is the default if --severity is omitted."},
+		{Item: "--severity=critical", HelpText: "Fire --end-to-end synthetic at critical severity (red sidebar)."},
+		{Item: "--severity=info", HelpText: "Fire --end-to-end synthetic at info severity (blue sidebar)."},
+		{Item: "--severity=all", HelpText: "Fire FOUR synthetic alerts per receiver: warning + critical + info + resolved. Use to visually verify every render path (color mapping, title format, resolved variant) in one shot. Multiplies the alert count — scope to one or two receivers for visual smoke tests."},
 	})
 	root.AddCommand(validate)
 

@@ -1,0 +1,83 @@
+# Triggers on `v*` tag push (e.g. `v1.0.3`). Builds the multi-arch
+# plugin bundle, generates a sha256 checksum, and creates a GitHub
+# Release with both attached.
+#
+# Operator workflow to ship a new version:
+#   1. Update plugin.json version + CHANGELOG.md entry
+#   2. git commit + push to main
+#   3. git tag -a v1.0.3 -m "release v1.0.3"
+#   4. git push origin v1.0.3
+#
+# Step 4 is what fires this workflow. No manual `make dist` or
+# `gh release create` required.
+#
+# Release notes are pulled from GitHub's auto-generated changelog
+# (commits since the previous tag). The body also links back to
+# CHANGELOG.md so reviewers can see the curated notes.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # needed to create the release + upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # softprops/action-gh-release uses git history to generate
+          # release notes between tags. Default checkout depth is 1
+          # (just the tag commit) which makes the auto-notes empty.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Same target the Build workflow uses. Cross-compiles for all
+      # five supported platforms and assembles the tarball at
+      # dist/com.mattermost.alertmanager-<version>.tar.gz.
+      - name: Build bundle
+        run: make dist
+
+      # Sidecar checksum so operators can verify the downloaded
+      # tarball matches what CI produced — standard hygiene for
+      # plugin distribution.
+      - name: Compute SHA256 checksum
+        run: |
+          cd dist
+          for f in *.tar.gz; do
+            sha256sum "$f" > "${f}.sha256"
+          done
+          ls -la
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          generate_release_notes: true
+          body: |
+            ## Mattermost Alertmanager Plugin ${{ github.ref_name }}
+
+            See [`CHANGELOG.md`](${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md) for the curated release notes.
+
+            ### Install
+
+            1. Download `com.mattermost.alertmanager-*.tar.gz` from the assets below.
+            2. (Optional) Verify the checksum:
+               ```bash
+               sha256sum -c com.mattermost.alertmanager-*.tar.gz.sha256
+               ```
+            3. Upload via System Console → Plugin Management → Choose File → Enable.
+
+            ### Auto-generated changelog

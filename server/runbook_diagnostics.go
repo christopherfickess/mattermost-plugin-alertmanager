@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"strings"
 
-	root "github.com/christopherfickess/mattermost-plugin-alertmanager"
+	root "github.com/mattermost/mattermost-plugin-alertmanager"
 )
 
 // labelPlaceholderAllowlist is the set of `<name>` tags a runbook

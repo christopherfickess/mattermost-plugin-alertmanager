@@ -36,43 +36,69 @@ Set it in System Console → Plugins → Alertmanager → Webhook host override.
 
 ## Required: route alerts to the right receiver
 
-The plugin creates **one receiver per runbook slug** (20 by default). For Alertmanager to actually route alerts to those receivers — instead of dumping everything on the fallback — your routing tree needs sub-routes that match labels.
+The plugin creates **one receiver per runbook slug, channel-suffixed**
+(e.g. `high-cpu-usage--alert-slo-channel`). For Alertmanager to
+actually route alerts to those receivers — instead of dumping
+everything on the fallback — your routing tree needs sub-routes that
+match labels.
 
-The simplest pattern: set a `runbook` label on every Prometheus rule that matches the receiver name. Example:
+The simplest pattern: set a `runbook` label on every Prometheus rule
+that matches a receiver's base slug. Example:
 
 ```yaml
 # Prometheus rule
 - alert: HighCPUUsage
-  expr: avg_over_time(node_cpu_seconds_total[5m]) > 0.8
+  expr: sum(rate(container_cpu_usage_seconds_total[5m])) by (namespace, pod) > 0.8
   for: 10m
   labels:
     severity: critical
-    runbook: high-cpu-usage      # ← matches plugin receiver name
+    runbook: high-cpu-usage      # ← matches plugin receiver's BASE slug
+    # namespace + pod auto-populated by Prometheus via the metric's labels
   annotations:
-    summary: "Node CPU > 80% for 10 minutes"
+    summary: "Pod CPU > 80% for 10 minutes"
 ```
 
-Then in `alertmanager.yml`:
+Then in `alertmanager.yml` — **but you don't write this block by hand.**
+`/alertmanager add` generates it for you and DMs it as
+`alertmanager-routes.yml`. The generated block looks like:
 
 ```yaml
 route:
-  receiver: default-fallback         # catch-all for unlabeled alerts
+  receiver: default-fallback         # catch-all for unlabeled alerts (you provide)
   group_by: ['alertname', 'cluster']
   group_wait: 30s
   group_interval: 5m
   repeat_interval: 4h                # production value, not the 5m dev default
 
   routes:
+    # ↓ PASTE FROM alertmanager-routes.yml HERE
     - matchers: [runbook="high-cpu-usage"]
-      receiver: high-cpu-usage
+      receiver: high-cpu-usage--alert-slo-channel
+      continue: true
     - matchers: [runbook="high-memory-usage"]
-      receiver: high-memory-usage
+      receiver: high-memory-usage--alert-slo-channel
+      continue: true
     - matchers: [runbook="pod-crashloopbackoff"]
-      receiver: pod-crashloopbackoff
+      receiver: pod-crashloopbackoff--alert-slo-channel
+      continue: true
     # ... one route per receiver, 20 total for the standard set
 ```
 
-This pattern keeps the alertname-to-runbook coupling **in the Prometheus rule** (next to the alert definition), not split across two files. Multiple alertnames can share one runbook (e.g., `NodeCPUSpike` and `K8sContainerCPUHigh` both set `runbook: high-cpu-usage`).
+`continue: true` on every plugin-generated route is what makes fan-out
+work (same `runbook` slug routed to multiple channels via separate
+`/alertmanager add` calls). Without it, AM stops at the first match
+and the second channel never gets the alert.
+
+The matcher always keys on the **base slug** (no `--channel` suffix)
+because the same runbook label fans out across all channels
+subscribed to it. The receiver name carries the suffix so AM's
+receiver list stays unique.
+
+This pattern keeps the alertname-to-runbook coupling **in the
+Prometheus rule** (next to the alert definition), not split across
+two files. Multiple alertnames can share one runbook (e.g.,
+`NodeCPUSpike` and `K8sContainerCPUHigh` both set
+`runbook: high-cpu-usage`).
 
 ## HA / multi-pod considerations
 

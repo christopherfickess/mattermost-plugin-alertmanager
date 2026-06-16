@@ -105,7 +105,7 @@ const pageTemplate = `<!DOCTYPE html>
             {{ end -}}
         </nav>
         <div class="sidebar-footer">
-            <a href="https://github.com/christopherfickess/mattermost-plugin-alertmanager">View on GitHub</a>
+            <a href="https://github.com/mattermost/mattermost-plugin-alertmanager">View on GitHub</a>
         </div>
     </aside>
 

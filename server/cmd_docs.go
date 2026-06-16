@@ -8,7 +8,7 @@ import (
 
 	"github.com/mattermost/mattermost/server/public/model"
 
-	root "github.com/christopherfickess/mattermost-plugin-alertmanager"
+	root "github.com/mattermost/mattermost-plugin-alertmanager"
 )
 
 // Mattermost's default post length limit is around 16k. Cap doc output
@@ -20,12 +20,13 @@ const maxDocPostBytes = 14000
 // the embedded filename. Explicit map so we can rename embedded files
 // without breaking the user-facing argument vocabulary.
 var docTopics = map[string]string{
+	"architecture":   "ARCHITECTURE.md",
 	"configuration":  "CONFIGURATION.md",
+	"development":    "DEVELOPMENT.md",
+	"kubernetes":     "KUBERNETES.md",
+	"rotation":       "ROTATION.md",
 	"slash_commands": "SLASH_COMMANDS.md",
 	"slash-commands": "SLASH_COMMANDS.md",
-	"development":    "DEVELOPMENT.md",
-	"migration":      "MIGRATION.md",
-	"architecture":   "ARCHITECTURE.md",
 }
 
 // handleDocs serves embedded docs from inside Mattermost. With no
@@ -48,7 +49,7 @@ func (p *Plugin) handleDocs(args *model.CommandArgs) (string, error) {
 		return "", fmt.Errorf("read embedded doc %q: %w", filename, err)
 	}
 
-	githubURL := fmt.Sprintf("https://github.com/christopherfickess/mattermost-plugin-alertmanager/blob/main/docs/%s", filename)
+	githubURL := fmt.Sprintf("https://github.com/mattermost/mattermost-plugin-alertmanager/blob/main/docs/%s", filename)
 	if len(body) <= maxDocPostBytes {
 		return fmt.Sprintf("**%s** — [view on GitHub](%s)\n\n%s", filename, githubURL, string(body)), nil
 	}
@@ -93,7 +94,7 @@ func listDocTopics() string {
 		if topic == "" {
 			topic = "(unregistered)"
 		}
-		b.WriteString(fmt.Sprintf("| `%s` | `docs/%s` | [link](https://github.com/christopherfickess/mattermost-plugin-alertmanager/blob/main/docs/%s) |\n",
+		b.WriteString(fmt.Sprintf("| `%s` | `docs/%s` | [link](https://github.com/mattermost/mattermost-plugin-alertmanager/blob/main/docs/%s) |\n",
 			topic, file, file))
 	}
 	b.WriteString("\nUsage: `/alertmanager docs <topic>`")

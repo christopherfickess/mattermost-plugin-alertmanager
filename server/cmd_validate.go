@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/christopherfickess/mattermost-plugin-alertmanager/server/alertmanager"
+	"github.com/mattermost/mattermost-plugin-alertmanager/server/alertmanager"
 	"github.com/mattermost/mattermost/server/public/model"
 	pmodel "github.com/prometheus/common/model"
 
@@ -70,7 +70,18 @@ func (p *Plugin) handleValidate(args *model.CommandArgs) (string, error) {
 
 	webhookTest := containsFlag(rest, "--webhook-test")
 	endToEnd := containsFlag(rest, "--end-to-end")
+
+	// --severity=<value> drives the end-to-end fire matrix.
+	// Accepted: warning, critical, info, all. `all` fires four
+	// synthetic alerts per receiver (warning + critical + info +
+	// resolved). Empty/missing defaults to warning. Validated by
+	// expandSeverityForFire — empty return slice = invalid value.
+	severityFlag, rest := extractFlagValue(rest, "--severity=")
 	rest = stripFlags(rest, "--webhook-test", "--end-to-end")
+	fireSpecs := expandSeverityForFire(severityFlag)
+	if endToEnd && fireSpecs == nil {
+		return fmt.Sprintf(":x: Invalid `--severity=%s` value. Accepted: `warning`, `critical`, `info`, `all`.", severityFlag), nil
+	}
 
 	// First positional, if any, is either a set name or a receiver name.
 	var target string
@@ -178,14 +189,12 @@ func (p *Plugin) handleValidate(args *model.CommandArgs) (string, error) {
 			}
 		}
 
-		// (d) End-to-end alert via AM — opt-in
+		// (d) End-to-end alert via AM — opt-in. Fires one synthetic per
+		// fireSpec. When --severity=all, this is 4 alerts per receiver
+		// (warning + critical + info + resolved); otherwise 1. Per-spec
+		// errors get aggregated into a single status string.
 		if endToEnd && st.ok {
-			alertID, err := postValidateSyntheticAlert(c.AlertManagerURL, receiverBaseSlug(c.Name), "", nil)
-			if err != nil {
-				r.EndToEndAlertID = "✗ " + err.Error()
-			} else {
-				r.EndToEndAlertID = "✓ alert id " + alertID
-			}
+			r.EndToEndAlertID = fireSyntheticMatrix(c.AlertManagerURL, receiverBaseSlug(c.Name), fireSpecs)
 		} else if endToEnd {
 			r.EndToEndAlertID = "— (AM unreachable)"
 		}
@@ -529,22 +538,46 @@ func postValidateTestMessage(webhookURL, receiverName string) error {
 // renders it through its template + posts to the receiver's webhook.
 // User watches the channel for delivery.
 //
-// We use a 30s-from-now `endsAt` so the alert auto-resolves quickly
-// and doesn't linger. labels include `test=validate` so it's
-// distinguishable from real traffic.
+// Firing alerts: startsAt=now, endsAt=now+30s — AM fires immediately
+// and auto-resolves after ~30s.
 //
-// severity defaults to "warning" when empty. extraLabels merge in
-// on top of the defaults — caller-supplied keys override the helper's
-// own (so e.g. a caller can override `alertname` or `severity` from
-// the admin form, but not the `test=validate` / `source=...` markers
-// since those are appended last to keep the synthetic-alert marker
-// authoritative).
-func postValidateSyntheticAlert(amURL, runbookSlug, severity string, extraLabels map[string]string) (string, error) {
+// Resolved alerts (resolved=true): startsAt=now-60s, endsAt=now-1s —
+// AM accepts the alert as already-resolved and sends the resolved
+// notification path (green sidebar, [✓ RESOLVED:] title prefix). Use
+// for visual matrix testing alongside firing alerts.
+//
+// labels include `test=validate` so synthetic traffic is
+// distinguishable from real. severity defaults to "warning" when
+// empty. extraLabels merge in on top of the defaults — caller-supplied
+// keys override the helper's own (so e.g. a caller can override
+// `alertname` or `severity` from the admin form, but not the
+// `test=validate` / `source=...` markers since those are appended
+// last to keep the synthetic-alert marker authoritative).
+func postValidateSyntheticAlert(amURL, runbookSlug, severity string, extraLabels map[string]string, resolved bool) (string, error) {
 	if severity == "" {
 		severity = "warning"
 	}
+	// Per-severity alertname so AM groups each severity into its own
+	// notification. Without this, --severity=all collapses
+	// warning + critical + info into one (3 firing) group post since
+	// AM's standard group_by includes alertname. Each spec needs a
+	// distinct alertname to materialize as a distinct chat post.
+	titleSeverity := strings.ToUpper(severity[:1]) + severity[1:]
+	alertname := "ValidateSyntheticTest" + titleSeverity
+	summary := fmt.Sprintf("Synthetic %s alert from /alertmanager validate", severity)
+	description := fmt.Sprintf("Validate diagnostic at %s severity — if you see this in the channel, AM → MM delivery works end-to-end. Auto-resolves in ~30 seconds.", severity)
+	if resolved {
+		// Resolved gets its own alertname too, plus startsAt/endsAt
+		// in the past below — the combination makes AM route this as
+		// a resolved-state notification independent of any firing
+		// counterpart.
+		alertname = "ValidateSyntheticTestResolved"
+		summary = "Resolved synthetic alert from /alertmanager validate"
+		description = "Resolved-state diagnostic — verifies the [✓ RESOLVED:] title and green sidebar render correctly."
+	}
+
 	labels := map[string]string{
-		"alertname": "ValidateSyntheticTest",
+		"alertname": alertname,
 		"runbook":   runbookSlug,
 	}
 	for k, v := range extraLabels {
@@ -556,14 +589,24 @@ func postValidateSyntheticAlert(amURL, runbookSlug, severity string, extraLabels
 	labels["test"] = "validate"
 	labels["source"] = "alertmanager-plugin-validate"
 
-	startsAt := time.Now().UTC().Format(time.RFC3339)
-	endsAt := time.Now().Add(30 * time.Second).UTC().Format(time.RFC3339)
+	var startsAt, endsAt string
+	if resolved {
+		// startsAt in the past + endsAt in the past = AM treats this
+		// as a resolved alert and immediately fires the resolved
+		// notification (no firing path).
+		startsAt = time.Now().Add(-60 * time.Second).UTC().Format(time.RFC3339)
+		endsAt = time.Now().Add(-1 * time.Second).UTC().Format(time.RFC3339)
+	} else {
+		startsAt = time.Now().UTC().Format(time.RFC3339)
+		endsAt = time.Now().Add(30 * time.Second).UTC().Format(time.RFC3339)
+	}
+
 	payload := []map[string]any{
 		{
 			"labels": labels,
 			"annotations": map[string]string{
-				"summary":     "Synthetic alert from /alertmanager validate",
-				"description": "This is a validate diagnostic — if you see this in the channel, AM → MM delivery works end-to-end. Auto-resolves in ~30 seconds.",
+				"summary":     summary,
+				"description": description,
 			},
 			"startsAt": startsAt,
 			"endsAt":   endsAt,
@@ -592,4 +635,75 @@ func postValidateSyntheticAlert(amURL, runbookSlug, severity string, extraLabels
 	// AM doesn't return an alert ID — it returns 200 with empty body.
 	// Use the runbook slug as the identifier for the user.
 	return runbookSlug, nil
+}
+
+// expandSeverityForFire turns a --severity flag value into the ordered
+// list of (severity, resolved) tuples to fire. Single severities fire
+// one alert; "all" fires four — warning, critical, info, plus a
+// resolved alert. Empty string defaults to warning (backwards compat
+// with the v1.0.2 single-fire behavior).
+//
+// The "all" expansion is deliberately ordered firing-first then
+// resolved so the chat history reads in increasing severity intensity
+// followed by the lifecycle's natural conclusion.
+func expandSeverityForFire(value string) []syntheticFireSpec {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	switch normalized {
+	case "all":
+		return []syntheticFireSpec{
+			{Severity: "warning", Resolved: false},
+			{Severity: "critical", Resolved: false},
+			{Severity: "info", Resolved: false},
+			{Severity: "info", Resolved: true},
+		}
+	case "critical", "warning", "info":
+		return []syntheticFireSpec{{Severity: normalized, Resolved: false}}
+	case "":
+		return []syntheticFireSpec{{Severity: "warning", Resolved: false}}
+	default:
+		// Unknown — caller validates against this; we return empty so
+		// the caller can surface a helpful error rather than firing the
+		// wrong thing.
+		return nil
+	}
+}
+
+// syntheticFireSpec is one alert AM should receive — a (severity,
+// resolved) pair. The full `all` matrix is four of these.
+type syntheticFireSpec struct {
+	Severity string
+	Resolved bool
+}
+
+// fireSyntheticMatrix fires one synthetic alert per fireSpec against
+// the given AM + runbook, returning a single status string suitable
+// for the validate report's End-to-end column. Aggregates per-spec
+// outcomes — partial-failure cases show `✓ 3 of 4` so the operator
+// can see something landed without paging up the AM logs.
+func fireSyntheticMatrix(amURL, runbookSlug string, specs []syntheticFireSpec) string {
+	if len(specs) == 0 {
+		return "— (no severity)"
+	}
+	ok := 0
+	var firstErr string
+	for _, s := range specs {
+		_, err := postValidateSyntheticAlert(amURL, runbookSlug, s.Severity, nil, s.Resolved)
+		if err != nil {
+			if firstErr == "" {
+				firstErr = err.Error()
+			}
+			continue
+		}
+		ok++
+	}
+	if ok == len(specs) {
+		if len(specs) == 1 {
+			return "✓ alert id " + runbookSlug
+		}
+		return fmt.Sprintf("✓ %d/%d (warning+critical+info+resolved)", ok, len(specs))
+	}
+	if ok == 0 {
+		return "✗ " + firstErr
+	}
+	return fmt.Sprintf("⚠ %d/%d — first error: %s", ok, len(specs), firstErr)
 }

@@ -10,7 +10,7 @@ import (
 	"github.com/mattermost/mattermost/server/public/model"
 	"github.com/prometheus/alertmanager/types"
 
-	"github.com/christopherfickess/mattermost-plugin-alertmanager/server/alertmanager"
+	"github.com/mattermost/mattermost-plugin-alertmanager/server/alertmanager"
 )
 
 // Channel-scoping is the load-bearing UX decision in this file. Every

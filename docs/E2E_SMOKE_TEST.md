@@ -103,6 +103,21 @@ In `#smoke-test`:
 loaded-in-AM fails but AM reach passes, the YAML didn't get
 applied — re-do step 4.
 
+### 5a. Simulate a route (no side effect)
+
+Read-only check that an alert with given labels would route to the
+expected receiver, before firing anything:
+
+```
+/alertmanager validate --simulate runbook=high-cpu-usage severity=warning
+```
+
+**Pass:** output names `high-cpu-usage--smoke-test` in the "Would
+dispatch to" list.
+**Fail:** "No sub-routes matched. Alert would fall through to the
+default receiver." Means your routes block didn't get applied or
+the matcher key isn't `runbook`. Re-check step 4.
+
 ### 6. Run an end-to-end synthetic alert
 
 ```

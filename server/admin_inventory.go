@@ -735,15 +735,38 @@ func (p *Plugin) runInventoryEndToEnd(targetSlugs []string, severity, extra stri
 	// which is intentional: those identify the alert as synthetic.
 	extraLabels := parseEndToEndExtraLabels(extra)
 
+	// Expand severity dropdown to one or more (severity, resolved)
+	// specs. "all" fires 4 alerts per slug (warning + critical + info +
+	// resolved); single severities fire 1. Empty falls back to warning.
+	specs := expandSeverityForFire(severity)
+	if specs == nil {
+		res.Mode = "error"
+		res.Error = fmt.Sprintf("Invalid severity %q. Accepted: warning, critical, info, all.", severity)
+		return res
+	}
+
 	for _, slug := range targetSlugs {
-		alertID, err := postValidateSyntheticAlert(amURL, slug, severity, extraLabels)
-		item := actionResult{Name: slug, OK: err == nil}
-		if err == nil {
-			item.Detail = "Fired synthetic alert id " + alertID + " — watch the bound channels for delivery."
-		} else {
-			item.Detail = err.Error()
+		// One actionResult row per (slug, spec) so the operator can
+		// see which combinations landed when --severity=all multiplies
+		// the alert count.
+		for _, s := range specs {
+			specLabel := s.Severity
+			if s.Resolved {
+				specLabel += " (resolved)"
+			}
+			displayName := slug
+			if len(specs) > 1 {
+				displayName = fmt.Sprintf("%s [%s]", slug, specLabel)
+			}
+			alertID, err := postValidateSyntheticAlert(amURL, slug, s.Severity, extraLabels, s.Resolved)
+			item := actionResult{Name: displayName, OK: err == nil}
+			if err == nil {
+				item.Detail = "Fired synthetic alert id " + alertID + " — watch the bound channels for delivery."
+			} else {
+				item.Detail = err.Error()
+			}
+			res.Items = append(res.Items, item)
 		}
-		res.Items = append(res.Items, item)
 	}
 
 	ok := 0
@@ -1080,6 +1103,7 @@ var inventoryTemplate = template.Must(template.New("inventory").Parse(`<!DOCTYPE
                         <option value="warning" {{if eq "warning" .SimulateSeverity}}selected{{end}}>warning</option>
                         <option value="critical" {{if eq "critical" .SimulateSeverity}}selected{{end}}>critical</option>
                         <option value="info" {{if eq "info" .SimulateSeverity}}selected{{end}}>info</option>
+                        <option value="all" {{if eq "all" .SimulateSeverity}}selected{{end}}>all (end-to-end only — fires warning+critical+info+resolved)</option>
                     </select>
                 </div>
             </div>

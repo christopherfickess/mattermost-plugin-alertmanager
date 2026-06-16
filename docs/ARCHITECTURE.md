@@ -287,20 +287,102 @@ at organizational scale:
 
 ---
 
+## Validation and drift detection (v1.0.1+)
+
+The federal design moves alert delivery out of the plugin, but
+leaves the plugin in the best position to validate the operator's
+hand-pasted YAML matches what was generated. v1.0.1 and v1.0.2
+added three checks along that boundary:
+
+- **Forward drift detection.** `/alertmanager validate` queries AM's
+  `/api/v2/status` for each unique AM URL and confirms the
+  receivers in plugin config are actually present in AM's loaded
+  YAML. Catches the silent-failure mode where an operator added
+  receivers via `/alertmanager add` but forgot to paste the YAML
+  into `alertmanager.yml`. Surfaces per-receiver in the slash
+  command output and as colored badges on the `/admin/inventory`
+  page.
+- **Inverse drift detection.** Same `/api/v2/status` data, opposite
+  direction: receivers loaded in AM that don't appear in plugin
+  config surface as an orange "AM-only receivers" section on the
+  inventory page. Catches hand-edits of `alertmanager.yml` plus
+  post-rotation gaps where the operator rotated a webhook via the
+  plugin but didn't paste the new YAML into AM.
+- **Schema validation.** `/alertmanager export --diff-against-loaded`
+  runs the merged YAML through `prometheus/alertmanager/config.Load`
+  before the operator pastes. Surfaces undefined-receiver
+  references, malformed matchers, and route-tree errors at
+  validation time instead of at AM-reload time. Same parser AM
+  itself uses, so anything that passes the plugin's check will
+  parse on AM's side.
+
+## Route simulation (v1.0.2+)
+
+`/alertmanager validate --simulate <labels>` and the route tester
+form on `/admin/inventory` walk Alertmanager's loaded route tree
+against a user-supplied label set and report which receiver(s) an
+alert with those labels would dispatch to. Mirrors `amtool config
+routes test` — answers "given my Prometheus rule's labels, where
+would this alert actually land?" without firing a real alert.
+
+Implementation uses `github.com/prometheus/alertmanager/dispatch.NewRoute`
+directly so the simulation matches AM's runtime behavior exactly
+(no parallel reimplementation that could drift from upstream). Read-only
+— no synthetic alert is fired, safe to run repeatedly.
+
+The admin form extends the simulation with three modes (simulate /
+webhook-test / end-to-end) and cascading Mode → Type → Target →
+Channel → Severity dropdowns. Type dropdown filters Target options
+(group names vs. individual runbook slugs); Channel dropdown filters
+to channels that actually host at least one matching receiver — all
+computed server-side, applied via client-side JS.
+
+## Webhook rotation reminders (v1.0.1+)
+
+Per-receiver `LastRotatedAt` + `LastReminderAt` timestamps drive a
+reminder-only rotation system. Global threshold via
+`WebhookRotationDays` System Console setting (default `0` = off),
+per-receiver opt-in via `on` flag on `/alertmanager add`. Both
+required — the global threshold alone fires nothing without the
+per-receiver opt-in.
+
+Background reconciler runs the reminder pass alongside orphan
+pruning every 5 minutes. When threshold > 0 AND receiver has opted
+in AND age > threshold AND no reminder sent in the last 7 days,
+DMs the calling sysadmin with the per-channel summary and the exact
+`/alertmanager rotate all --overdue` command.
+
+No auto-rotation by design. AM has no write API; an auto-rotation
+feature would either silently break delivery (rotate without
+updating AM) or reach into the operator's `alertmanager.yml` (out
+of scope — that file lives wherever the operator deploys AM). The
+right boundary is "plugin reminds; operator pastes." See
+[`ROTATION.md`](ROTATION.md).
+
 ## Open questions for v1.x
 
-The federal design has known gaps we're tracking:
+Known gaps that haven't shipped:
 
-- **Custom user-supplied templates.** v1.0 ships four built-in templates;
-  arbitrary user templates open security concerns (template injection,
-  info disclosure via overly-permissive label exposure) that deserve
-  thought before opening up.
-- **HA dedup as an Alertmanager-side recipe.** We don't ship a plugin
-  for this anymore; the answer is "configure your Alertmanager peers
-  correctly." Worth a documented playbook.
-- **Interactive expire-silence flow.** v1.0 falls back to `/alertmanager
-  expire_silence <name> <silence-id>` typed by hand. v1.1 may bring
-  back something button-shaped via Mattermost's interactive dialogs,
-  but it'll be triggered from `/alertmanager silences` rather than
-  inline on alert posts — those are owned by Mattermost's webhook
-  pipeline now, not the plugin.
+- **Custom user-supplied templates.** v1.0 ships four built-in
+  templates; arbitrary user templates open security concerns
+  (template injection, info disclosure via overly-permissive label
+  exposure) that deserve thought before opening up.
+- **HA dedup as an Alertmanager-side recipe.** We don't ship a
+  plugin-layer dedup anymore; the answer is "configure your
+  Alertmanager peers correctly." Worth a documented playbook in a
+  future release.
+- **Interactive expire-silence flow.** v1.0 falls back to
+  `/alertmanager expire_silence <name> <silence-id>` typed by hand.
+  A v1.x enhancement might bring back something button-shaped via
+  Mattermost's interactive dialogs, but it'll be triggered from
+  `/alertmanager silences` rather than inline on alert posts —
+  those are owned by Mattermost's webhook pipeline now, not the
+  plugin.
+- **Per-channel rotation threshold.** A single global
+  `WebhookRotationDays` applies to every opted-in receiver. No
+  per-channel override exists; workaround is opt-out via not
+  passing `on`.
+- **Multi-sysadmin reminder fan-out.** Rotation reminders go to the
+  single sysadmin whose identity the reconciler borrows for its
+  ephemeral PAT. v1 doesn't enumerate channel team admins or
+  broadcast to all sysadmins.

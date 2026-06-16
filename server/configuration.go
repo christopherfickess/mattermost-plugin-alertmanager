@@ -55,12 +55,32 @@ type configuration struct {
 // Notably absent vs. the cpanato plugin: no Token field. Authentication of
 // inbound alerts is whatever Mattermost's native incoming webhook system
 // uses (the random hook-id in the URL). The plugin owns no shared secrets.
+//
+// Webhook sharing (v1.0.3+): multiple alertConfig entries may share a single
+// WebhookID when they were created in the same /alertmanager add invocation.
+// Group adds (e.g., `add ... compute`) produce N receivers all pointing at
+// one Mattermost webhook. Individual slug adds (e.g., `add ... high-cpu-usage`)
+// produce a single receiver with its own webhook. The GroupName field
+// disambiguates and enables refcount-based cleanup on remove. Pre-v1.0.3
+// receivers have empty GroupName and are treated as individual (each owns
+// its webhook) for backwards compatibility.
 type alertConfig struct {
 	Name            string `json:"name"`
 	Team            string `json:"team"`
 	Channel         string `json:"channel"`
 	AlertManagerURL string `json:"alertManagerURL,omitempty"`
 	WebhookID       string `json:"webhookID"`
+
+	// GroupName identifies the unit this receiver was created under.
+	// Receivers sharing GroupName + Team + Channel also share WebhookID.
+	// Values:
+	//   - Category set keyword: "all", "compute", "application",
+	//     "database", "networking", "observability", "storage"
+	//   - Runbook slug: "high-cpu-usage", etc. — set when the receiver
+	//     was created via an individual /alertmanager add <slug> call
+	//   - Empty: legacy receiver from v1.0.0-v1.0.2 before group webhooks
+	//     existed. Treated as individual for backwards compatibility.
+	GroupName string `json:"groupName,omitempty"`
 
 	// WebhookHostOverride lets a sysadmin pin a per-receiver host that
 	// takes precedence over the global WebhookHost setting at YAML
@@ -218,7 +238,15 @@ func parseAlertConfigs(blob string) ([]alertConfig, error) {
 	}
 
 	seenNames := make(map[string]struct{}, len(entries))
-	seenWebhookIDs := make(map[string]struct{}, len(entries))
+	// Track each webhookID's owner (team + channel + group) so we can
+	// reject mismatches while allowing legitimate sharing across the
+	// receivers in a single group/individual add invocation.
+	type webhookOwner struct {
+		team    string
+		channel string
+		group   string
+	}
+	seenWebhooks := make(map[string]webhookOwner, len(entries))
 	for i := range entries {
 		entries[i].AlertManagerURL = strings.TrimRight(entries[i].AlertManagerURL, "/")
 		if err := entries[i].IsValid(); err != nil {
@@ -227,13 +255,27 @@ func parseAlertConfigs(blob string) ([]alertConfig, error) {
 		if _, dup := seenNames[entries[i].Name]; dup {
 			return nil, fmt.Errorf("duplicate alertConfig name %q", entries[i].Name)
 		}
-		// Two entries pointing at the same webhookID would have ambiguous
-		// remove/rotate semantics. Reject at parse time.
-		if _, dup := seenWebhookIDs[entries[i].WebhookID]; dup {
-			return nil, fmt.Errorf("alertConfig[%d] name=%q: webhookID is already used by another alertConfig", i, entries[i].Name)
+		// WebhookID sharing constraint: receivers sharing a webhookID
+		// must also share team + channel + groupName. Mismatches
+		// indicate either operator error during a System Console
+		// hand-edit or a bug in the plugin's own writes — reject at
+		// parse time so the bad state can't activate.
+		owner := webhookOwner{
+			team:    entries[i].Team,
+			channel: entries[i].Channel,
+			group:   entries[i].GroupName,
+		}
+		if existing, seen := seenWebhooks[entries[i].WebhookID]; seen {
+			if existing != owner {
+				return nil, fmt.Errorf("alertConfig[%d] name=%q: webhookID %q is shared with a receiver in team=%q channel=%q group=%q; sharing requires matching team+channel+group (got team=%q channel=%q group=%q)",
+					i, entries[i].Name, entries[i].WebhookID,
+					existing.team, existing.channel, existing.group,
+					owner.team, owner.channel, owner.group)
+			}
+		} else {
+			seenWebhooks[entries[i].WebhookID] = owner
 		}
 		seenNames[entries[i].Name] = struct{}{}
-		seenWebhookIDs[entries[i].WebhookID] = struct{}{}
 	}
 	return entries, nil
 }

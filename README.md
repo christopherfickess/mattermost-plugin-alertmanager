@@ -11,7 +11,7 @@ but the runbook-at-fire-time experience is why your on-call wants it.
 ## What an alert looks like in chat
 
 ```
-[FIRING:1] HighCPUUsage (namespace=billing, pod=api-7d9-2xfgs)
+[WARNING:HighCPUUsage] (namespace=billing, pod=api-7d9-2xfgs)
 
 **Alert:** HighCPUUsage - warning
 **Description:** Sustained high CPU may indicate runaway processes...
@@ -156,7 +156,7 @@ make dist-host     # current host's arch only (faster for dev iter)
 make deploy-local  # build + upload to localhost:8065
 ```
 
-Requires `MM_ADMIN_TOKEN` for deploy targets.
+Requires `MM_ADMIN_TOKEN` and `MM_SERVICESETTINGS_SITEURL` for deploy targets.
 
 ## Contributing
 

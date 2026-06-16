@@ -150,3 +150,81 @@ receivers:
 		}
 	})
 }
+
+// TestExpandSeverityForFire pins the contract for the --severity flag:
+// what each accepted value expands to, which strings are invalid, and
+// what the `all` matrix looks like.
+func TestExpandSeverityForFire(t *testing.T) {
+	t.Run("empty defaults to warning (backwards compat)", func(t *testing.T) {
+		got := expandSeverityForFire("")
+		if len(got) != 1 || got[0].Severity != "warning" || got[0].Resolved {
+			t.Fatalf("expected [warning,firing], got %+v", got)
+		}
+	})
+
+	t.Run("warning is single firing", func(t *testing.T) {
+		got := expandSeverityForFire("warning")
+		if len(got) != 1 || got[0].Severity != "warning" || got[0].Resolved {
+			t.Fatalf("expected [warning,firing], got %+v", got)
+		}
+	})
+
+	t.Run("critical is single firing", func(t *testing.T) {
+		got := expandSeverityForFire("critical")
+		if len(got) != 1 || got[0].Severity != "critical" || got[0].Resolved {
+			t.Fatalf("expected [critical,firing], got %+v", got)
+		}
+	})
+
+	t.Run("info is single firing", func(t *testing.T) {
+		got := expandSeverityForFire("info")
+		if len(got) != 1 || got[0].Severity != "info" || got[0].Resolved {
+			t.Fatalf("expected [info,firing], got %+v", got)
+		}
+	})
+
+	t.Run("all expands to 4 specs in order", func(t *testing.T) {
+		got := expandSeverityForFire("all")
+		if len(got) != 4 {
+			t.Fatalf("expected 4 specs, got %d (%+v)", len(got), got)
+		}
+		// Order matters — firing severities ascending then resolved.
+		// Caller relies on this for the chat-history reading order.
+		want := []syntheticFireSpec{
+			{Severity: "warning", Resolved: false},
+			{Severity: "critical", Resolved: false},
+			{Severity: "info", Resolved: false},
+			{Severity: "info", Resolved: true},
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("spec[%d] = %+v, want %+v", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("case insensitive", func(t *testing.T) {
+		gotAll := expandSeverityForFire("ALL")
+		gotCritical := expandSeverityForFire("Critical")
+		if len(gotAll) != 4 {
+			t.Errorf("ALL should expand same as all, got %d specs", len(gotAll))
+		}
+		if len(gotCritical) != 1 || gotCritical[0].Severity != "critical" {
+			t.Errorf("Critical should normalize to critical, got %+v", gotCritical)
+		}
+	})
+
+	t.Run("whitespace trimmed", func(t *testing.T) {
+		got := expandSeverityForFire("  warning  ")
+		if len(got) != 1 || got[0].Severity != "warning" {
+			t.Errorf("expected [warning], got %+v", got)
+		}
+	})
+
+	t.Run("unknown value returns nil so caller surfaces error", func(t *testing.T) {
+		got := expandSeverityForFire("emergency")
+		if got != nil {
+			t.Errorf("expected nil for unknown, got %+v", got)
+		}
+	})
+}

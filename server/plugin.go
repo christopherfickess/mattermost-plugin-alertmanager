@@ -11,7 +11,7 @@ import (
 	"github.com/mattermost/mattermost/server/public/plugin"
 	"github.com/mattermost/mattermost/server/public/pluginapi"
 
-	root "github.com/christopherfickess/mattermost-plugin-alertmanager"
+	root "github.com/mattermost/mattermost-plugin-alertmanager"
 )
 
 var Manifest = root.Manifest
