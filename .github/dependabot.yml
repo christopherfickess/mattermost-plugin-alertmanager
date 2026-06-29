@@ -1,0 +1,104 @@
+# Dependabot config: scheduled dep updates across all three of our
+# dependency ecosystems. PRs land on Monday mornings so weekly review
+# is predictable; max 5 open PRs per ecosystem to avoid swamping
+# review capacity on a low-traffic repo.
+#
+# Security updates (separate from version updates configured here)
+# are also enabled at the repo level — those fire immediately when
+# GHSA publishes a new advisory affecting a pinned dep, regardless
+# of this schedule.
+
+version: 2
+updates:
+  # Go modules — the plugin server. Includes transitive deps so the
+  # full security surface is tracked.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - go
+    commit-message:
+      prefix: "deps(go)"
+      include: scope
+    groups:
+      # Group minor + patch bumps into one PR per ecosystem so review
+      # noise stays low. Majors stay separate (breaking changes).
+      go-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # build/ sub-modules each have their own go.mod (manifest, pluginctl,
+  # render-docs). Cover them too so the build tooling stays current.
+  - package-ecosystem: gomod
+    directory: /build/manifest
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - go
+      - build-tooling
+    commit-message:
+      prefix: "deps(build/manifest)"
+
+  - package-ecosystem: gomod
+    directory: /build/pluginctl
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - go
+      - build-tooling
+    commit-message:
+      prefix: "deps(build/pluginctl)"
+
+  - package-ecosystem: gomod
+    directory: /build/render-docs
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - go
+      - build-tooling
+    commit-message:
+      prefix: "deps(build/render-docs)"
+
+  # GitHub Actions used by .github/workflows/*.yml. Keeps action SHAs
+  # current — important because we pin all actions to SHAs (security),
+  # which means we don't get automatic updates the way @v4 tag users do.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: "deps(actions)"
+    groups:
+      actions-minor-patch:
+        update-types:
+          - minor
+          - patch

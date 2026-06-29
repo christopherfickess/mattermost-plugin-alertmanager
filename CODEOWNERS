@@ -1,0 +1,28 @@
+# Auto-request reviews from the owners listed below. Order matters: the
+# last matching pattern wins. Patterns follow gitignore syntax.
+#
+# To add team-level ownership later, replace @christopherfickess with
+# @org/team-slug — only org members can own paths.
+
+# Default owner for everything not matched by a more specific rule.
+*                                       @christopherfickess
+
+# Security-critical surfaces. Same owner today, but separated so adding
+# a security-team handle later only touches these lines.
+/.github/workflows/security.yml         @christopherfickess
+/.github/workflows/release.yml          @christopherfickess
+/.grype.yaml                            @christopherfickess
+/.golangci.yml                          @christopherfickess
+/SECURITY.md                            @christopherfickess
+
+# Build pipeline / packaging.
+/Makefile                               @christopherfickess
+/build/                                 @christopherfickess
+/plugin.json                            @christopherfickess
+
+# Dependencies — every change to go.mod/go.sum should get a look.
+/go.mod                                 @christopherfickess
+/go.sum                                 @christopherfickess
+
+# Embedded runbooks — domain knowledge, not just code.
+/runbooks/                              @christopherfickess
